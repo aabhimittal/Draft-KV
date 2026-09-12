@@ -9,11 +9,12 @@ against the true optimum is exactly computable.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
 from .config import CompressionConfig
-from .throughput import CostModel, best_gamma, expected_tokens
+from .throughput import CostModel, best_gamma, best_gamma_profile, expected_tokens
 
 
 def plausible_alpha(cfg: CompressionConfig, difficulty: float = 1.0) -> float:
@@ -28,28 +29,51 @@ def plausible_alpha(cfg: CompressionConfig, difficulty: float = 1.0) -> float:
     return float(np.clip(1.0 - difficulty * (bit_pen + drop_pen), 0.01, 0.995))
 
 
+def rising_profile(alpha0: float, depth: int = 12, gain: float = 0.45) -> list[float]:
+    """Depth profile of the shape measured on the reference model.
+
+    Acceptance starts at `alpha0` and climbs toward 1 with depth -- survivorship,
+    not drift: a draft that has already survived i tokens is in a stretch the
+    compressed cache happens to model well.  `gain` sets how much of the gap to
+    1.0 is closed by depth ~3.
+    """
+    return [float(np.clip(1.0 - (1.0 - alpha0) * (1.0 - gain) ** d, 0.0, 1.0)) for d in range(depth)]
+
+
 @dataclass
 class BanditEnv:
-    """Draws (accepted | gamma) from the truncated geometric implied by alpha."""
+    """Draws (accepted | gamma) from the acceptance model.
+
+    `alphas` gives one constant acceptance rate per config.  `profiles`, when
+    supplied, overrides it with a depth-indexed profile per config -- the shape
+    the reference model actually exhibits.
+    """
 
     alphas: dict[CompressionConfig, float]
     ctx: int = 32768
     seed: int = 0
+    profiles: dict[CompressionConfig, Sequence[float]] | None = None
 
     def __post_init__(self) -> None:
         self.rng = np.random.default_rng(self.seed)
 
+    def accept_profile(self, cfg: CompressionConfig, depth: int) -> list[float]:
+        if self.profiles is not None:
+            p = list(self.profiles[cfg])
+            return (p + [p[-1]] * depth)[:depth]
+        return [self.alphas[cfg]] * depth
+
     def pull(self, cfg: CompressionConfig, gamma: int) -> int:
-        a = self.alphas[cfg]
+        prof = self.accept_profile(cfg, gamma)
         k = 0
-        while k < gamma and self.rng.random() < a:
+        while k < gamma and self.rng.random() < prof[k]:
             k += 1
         return k
 
     def true_best(self, cost: CostModel, gamma_max: int = 8) -> tuple[CompressionConfig, int, float]:
         rows = []
-        for cfg, a in self.alphas.items():
-            g, t = best_gamma(cost, cfg, a, self.ctx, gamma_max)
+        for cfg in self.alphas:
+            g, t = best_gamma_profile(cost, cfg, self.accept_profile(cfg, gamma_max), self.ctx)
             rows.append((t, cfg, g))
         t, cfg, g = max(rows)
         return cfg, g, t
@@ -69,7 +93,7 @@ def run_bandit(
     good: it rewards thrashing between near-equal arms, which on real hardware
     means requantizing the whole drafter cache every few tokens.
     """
-    _, _, opt_t = env.true_best(cost)
+    _, _, opt_t = env.true_best(cost, 12)
     total_t = 0.0
     regret = []
     picks = []
@@ -81,7 +105,9 @@ def run_bandit(
             k = env.pull(cfg, gamma)
             extra = 0.0 if (prev is None or cfg == prev) else cost.rebuild_cost(env.ctx)
             switches += extra > 0
-            t = cost.throughput(cfg, gamma, env.alphas[cfg], env.ctx, extra)
+            # scored against the environment's TRUE profile, whatever model the
+            # controller used to choose -- so a mis-specified model is penalized
+            t = cost.throughput_profile(cfg, env.accept_profile(cfg, gamma), env.ctx, extra)
             prev = cfg
         else:
             k = 0

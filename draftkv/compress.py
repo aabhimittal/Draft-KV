@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from .config import CompressionConfig
+from typing import Sequence
+
+from .config import CompressionConfig, LayerPlan
 
 
 # --------------------------------------------------------------------------
@@ -98,9 +100,18 @@ class CompressedKVCache:
     Evicting is what actually buys speed: fewer rows to stream per draft step.
     """
 
-    def __init__(self, n_layers: int, cfg: CompressionConfig) -> None:
+    def __init__(self, n_layers: int, cfg: CompressionConfig | Sequence[CompressionConfig]) -> None:
         self.n_layers = n_layers
-        self.cfg = cfg
+        if isinstance(cfg, LayerPlan):
+            self.cfgs = list(cfg.cfgs)
+        elif isinstance(cfg, CompressionConfig):
+            self.cfgs = [cfg] * n_layers
+        else:
+            self.cfgs = list(cfg)
+        if True:
+            if len(self.cfgs) != n_layers:
+                raise ValueError(f"expected {n_layers} per-layer configs, got {len(self.cfgs)}")
+        self.cfg = self.cfgs[0]
         self.k: list[list[np.ndarray]] = [[] for _ in range(n_layers)]
         self.v: list[list[np.ndarray]] = [[] for _ in range(n_layers)]
         self.pos: list[list[int]] = [[] for _ in range(n_layers)]
@@ -109,8 +120,9 @@ class CompressedKVCache:
 
     # -- model-facing interface -------------------------------------------
     def append(self, layer: int, k: np.ndarray, v: np.ndarray, pos: np.ndarray) -> None:
-        kq = quantize(k, self.cfg.bits)
-        vq = quantize(v, self.cfg.bits)
+        cfg = self.cfgs[layer]
+        kq = quantize(k, cfg.bits)
+        vq = quantize(v, cfg.bits)
         for i in range(kq.shape[0]):
             self.k[layer].append(kq[i])
             self.v[layer].append(vq[i])
@@ -139,18 +151,20 @@ class CompressedKVCache:
             self.score[layer][i] += float(mass[i])
 
     # -- control ----------------------------------------------------------
-    def budget(self) -> int:
-        keep = int(round(self.cfg.keep_frac * max(self.seen_positions, 1)))
-        return max(keep, self.cfg.sink + self.cfg.recent)
+    def budget(self, layer: int = 0) -> int:
+        cfg = self.cfgs[layer]
+        keep = int(round(cfg.keep_frac * max(self.seen_positions, 1)))
+        return max(keep, cfg.sink + cfg.recent)
 
     def _evict(self, layer: int) -> None:
+        cfg = self.cfgs[layer]
         n = len(self.pos[layer])
-        budget = self.budget()
+        budget = self.budget(layer)
         if n <= budget:
             return
         pos = np.asarray(self.pos[layer])
         order = np.argsort(pos)
-        protected = set(order[: self.cfg.sink].tolist()) | set(order[-self.cfg.recent :].tolist())
+        protected = set(order[: cfg.sink].tolist()) | set(order[-cfg.recent :].tolist())
         free = [i for i in range(n) if i not in protected]
         n_drop = n - budget
         if n_drop <= 0 or not free:
@@ -197,5 +211,8 @@ class CompressedKVCache:
         return len(self.pos[0])
 
     def nbytes(self, n_heads: int, d_head: int) -> float:
-        per = self.cfg.bytes_per_entry(d_head)
-        return 2.0 * self.length * n_heads * per * self.n_layers
+        """Actual bytes held, summed per layer (configs may differ per layer)."""
+        return sum(
+            2.0 * len(self.pos[L]) * n_heads * self.cfgs[L].bytes_per_entry(d_head)
+            for L in range(self.n_layers)
+        )

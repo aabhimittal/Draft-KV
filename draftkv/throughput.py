@@ -14,6 +14,7 @@ bounded by `CostModel.ceiling()`, and no acceptance rate can exceed it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
@@ -35,6 +36,24 @@ def expected_tokens(alpha: float, gamma: int) -> float:
     if alpha >= 1.0 - 1e-12:
         return float(gamma + 1)
     return float((1.0 - alpha ** (gamma + 1)) / (1.0 - alpha))
+
+
+def expected_tokens_profile(accept: Sequence[float]) -> float:
+    """E for a depth-indexed acceptance profile: a_i = P(accept at depth i | reached i).
+
+    E = 1 + sum_k prod_{i<k} a_i, over k = 1..len(accept).
+
+    Why this exists: `expected_tokens` assumes one constant alpha, but measured
+    profiles are not flat -- acceptance *rises* with depth, because reaching
+    depth i is itself evidence that the current region is easy to draft.  The
+    i.i.d. model therefore understates E and picks gamma too small.  With a
+    constant profile this reduces exactly to `expected_tokens`.
+    """
+    total, run = 1.0, 1.0
+    for a in accept:
+        run *= float(np.clip(a, 0.0, 1.0))
+        total += run
+    return total
 
 
 @dataclass
@@ -70,7 +89,10 @@ class CostModel:
         """K and V, fp16, all layers, whole batch."""
         return 2.0 * ctx * self.n_layers * self.n_kv_heads * self.d_head * 2.0 * self.batch
 
-    def draft_kv_bytes(self, cfg: CompressionConfig, ctx: int) -> float:
+    def draft_kv_bytes(self, cfg, ctx: int) -> float:
+        """Bytes the drafter streams per token. Accepts a config or a LayerPlan."""
+        if hasattr(cfg, "per_layer_bytes"):
+            return cfg.per_layer_bytes(ctx, self.n_kv_heads, self.d_head) * self.batch
         kept = min(ctx, max(cfg.sink + cfg.recent, int(round(cfg.keep_frac * ctx))))
         per = cfg.bytes_per_entry(self.d_head)
         return 2.0 * kept * self.n_layers * self.n_kv_heads * per * self.batch
@@ -141,6 +163,26 @@ class CostModel:
         """
         return ctx * self.resync_per_token
 
+    def round_cost_profile(
+        self, cfg: CompressionConfig, accept: Sequence[float], ctx: int, extra_cost: float = 0.0
+    ) -> float:
+        gamma = len(accept)
+        return (
+            gamma * self.t_draft(cfg, ctx)
+            + self.t_verify(ctx, gamma)
+            + expected_tokens_profile(accept) * self.resync_per_token
+            + self.controller_overhead
+            + extra_cost
+        )
+
+    def throughput_profile(
+        self, cfg: CompressionConfig, accept: Sequence[float], ctx: int, extra_cost: float = 0.0
+    ) -> float:
+        """Throughput under a depth-indexed acceptance profile."""
+        if not accept:
+            return 1.0 / self.t_baseline(ctx)
+        return expected_tokens_profile(accept) / self.round_cost_profile(cfg, accept, ctx, extra_cost)
+
     def round_cost(
         self, cfg: CompressionConfig, gamma: int, alpha: float, ctx: int, extra_cost: float = 0.0
     ) -> float:
@@ -179,6 +221,27 @@ class CostModel:
         return (base + self.compute_per_token + self.fixed_verify) / (
             draft + self.compute_per_token + self.fixed_draft + self.resync_per_token
         )
+
+
+def best_gamma_profile(
+    cost: CostModel,
+    cfg: CompressionConfig,
+    accept: Sequence[float],
+    ctx: int,
+    extra_cost: float = 0.0,
+) -> tuple[int, float]:
+    """Argmax over gamma given a depth profile; gamma indexes into `accept`.
+
+    Still a scan, but no longer unimodal-by-construction: a profile that rises
+    with depth can make a longer draft pay off after a shorter one did not, so
+    the whole range is evaluated rather than stopping at the first decline.
+    """
+    best, best_t = 0, cost.throughput_profile(cfg, (), ctx)
+    for g in range(1, len(accept) + 1):
+        t = cost.throughput_profile(cfg, accept[:g], ctx, extra_cost)
+        if t > best_t:
+            best, best_t = g, t
+    return best, best_t
 
 
 def best_gamma(

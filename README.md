@@ -14,10 +14,12 @@ verify pass reports on every step.
 This repository is a from-scratch, dependency-light implementation (numpy only)
 with the losslessness claim as an executable test rather than an assertion.
 
+![tests](https://github.com/aabhimittal/Draft-KV/actions/workflows/tests.yml/badge.svg)
+
 ```bash
 pip install -e .
-python -m draftkv.bench all      # seven experiments
-pytest -q                        # 41 tests
+python -m draftkv.bench all      # nine experiments
+pytest -q                        # 69 tests
 ```
 
 ## The idea in one paragraph
@@ -147,6 +149,96 @@ tax first. The case for the controller is that it lands on that arm without
 hindsight, stays far above the config you would pick blind throughout, and keeps
 working when the content changes, which no fixed choice does.
 
+## Two corrections the measurements forced
+
+The first version of this took the problem statement's model at face value: one
+acceptance rate per config, applied uniformly to every layer. Instrumenting the
+reference model showed both halves of that are wrong, in ways that cost real
+throughput.
+
+### Acceptance is not flat in draft depth -- it *rises*
+
+Measured P(accept at depth i | reached depth i), config 4b/keep0.5:
+
+```
+depth   0     1     2     3     4     5     6     7
+      0.51  0.80  0.83  0.85  0.88  1.00  0.93  0.93
+```
+
+This is survivorship, not drift. Reaching depth *i* is itself evidence that the
+current stretch of text drafts easily, so the conditional rate climbs. I
+expected the opposite -- that the drafter's own approximate K/V would compound
+error within a round and push acceptance *down*. It does not.
+
+The consequence is not a rounding error. Fitting one alpha to this data anchors
+it near the depth-0 rate, and `E(alpha, gamma)` then truncates gamma hard:
+
+| model | gamma* | throughput under the true profile |
+|---|---|---|
+| depth-indexed profile | 12 | 1.99x |
+| one alpha, fitted at depth 0 | 2 | 1.54x |
+
+`expected_tokens_profile(accept)` replaces the closed form with
+`1 + sum_k prod_{i<k} a_i`, and reduces to it exactly when the profile is flat
+(tested). `DepthThompsonController` keeps one Beta per (config, depth) -- the
+same observations, indexed rather than pooled. Online, against an environment
+with this shape: **97.6% of optimal vs 88.2%** for the pooled controller, and no
+worse than it when the data really is flat.
+
+### Layers do not deserve equal bits
+
+Acceptance with exactly one layer degraded, everything else fp16:
+
+| layer | 2b/keep0.5 | 3b/keep0.5 | 4b/keep1 | 8b/keep1 |
+|---|---|---|---|---|
+| 0 | 0.31 | 0.35 | 0.69 | 1.00 |
+| 1 | 0.40 | 0.59 | **0.96** | 1.00 |
+| 2 | 0.29 | 0.47 | 0.91 | 1.00 |
+
+Layer 1 shrugs off 4-bit; layer 2 does not. Uniform compression overpays in
+tolerant layers and starves sensitive ones. `LayerPlan` allows a per-layer
+assignment, `profile_layers` measures the table above, and `allocate` spends a
+byte budget to minimize total damage. Measured acceptance at equal bytes:
+
+| budget (B) | allocated plan | alpha | best uniform in budget | alpha |
+|---|---|---|---|---|
+| 84,480 | 3b x2, 4b x1 | **0.747** | 3b/keep0.5 | 0.446 |
+| 115,200 | 4b x3 (uniform *is* optimal here) | 0.636 | 4b/keep1 | 0.636 |
+| 145,920 | 4b x2, 8b x1 | **0.870** | 4b/keep1 | 0.636 |
+| 176,640 | 4b x1, 8b x2 | **0.958** | 4b/keep1 | 0.636 |
+
+Two things had to be right, and neither was on the first attempt:
+
+- **The objective.** Per-layer damages are assumed to add in log-acceptance.
+  That is a serviceable *ordering* and a poor absolute predictor -- it
+  over-estimates damage badly once several layers are degraded at once. The
+  tests pin the ordering, not the prediction.
+- **The optimizer.** Greedy over adjacent upgrades is not optimal: it cannot
+  climb a layer whose value sits entirely in its top config, since every
+  intermediate step scores zero gain, and it strands that layer at 2-bit while
+  overspending elsewhere. `allocate` solves the multiple-choice knapsack exactly
+  over a Pareto frontier of (cost, damage) states; `allocate_greedy` is kept as
+  the baseline that shows why. An intermediate version bucketed the byte axis
+  and was also wrong -- three layers each rounding up by a third of a bucket
+  read as one bucket over budget, so an exactly-affordable uniform plan was
+  rejected in favour of something worse. Exact costs remove the failure mode,
+  and a regression test holds the line.
+
+A caveat that matters for anyone profiling a real model: the acceptance
+differences between neighbouring configs are often ~0.05, and a short profiling
+run cannot resolve them. `SensitivityProfile.trials` reports the sample count
+behind each cell for exactly this reason -- under a couple of hundred drafted
+tokens the profile is noise, and the allocation degrades with it.
+
+### One feature that did not survive measurement
+
+Gating the draft loop on the drafter's own confidence -- stop early when its
+next-token distribution goes flat -- is an obvious idea and is *not* implemented.
+On the reference model every sample lands in a single confidence bucket
+(point-biserial correlation with acceptance: 0.185), so there is no signal here
+to build on. It may well work on a real LM with sharper distributions. Without
+evidence, it stays out.
+
 ## Correctness
 
 - **Greedy decoding: byte-identical output.** Every emitted token is the argmax
@@ -179,10 +271,12 @@ Two subtleties that are easy to get wrong and are handled explicitly:
 | `compress.py` | group-wise int quantization; `FullKVCache` / `CompressedKVCache` behind one interface; sink + recent + heavy-hitter eviction |
 | `model.py` | small causal transformer in numpy — cache-agnostic by construction |
 | `engine.py` | the draft/verify loop, rollback, and resync |
-| `throughput.py` | `E(alpha, gamma)`, the memory-traffic cost model, `ceiling()`, `best_gamma` |
-| `controller.py` | Thompson sampling, flat-product baseline, oracle, fixed policies |
+| `throughput.py` | `E(alpha, gamma)`, the depth-indexed `E`, the memory-traffic cost model, `ceiling()`, `best_gamma` |
+| `controller.py` | Thompson sampling (pooled and depth-indexed), flat-product baseline, oracle, fixed policies |
+| `layers.py` | per-layer sensitivity profiling and exact-knapsack bit allocation |
 | `sim.py` | bandit environment with known ground-truth `alpha(c)` |
-| `bench.py` | the seven experiments |
+| `bench.py` | the nine experiments |
+| `.github/workflows/tests.yml` | CI: full suite on Python 3.10-3.13, losslessness as a separate fast lane |
 
 The reference model has random weights, so the text is gibberish — irrelevant,
 because every quantity under test is structural. Its `attn_sharpness` /
