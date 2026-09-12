@@ -1,0 +1,19 @@
+[project]
+name = "draftkv"
+version = "0.1.0"
+description = "KV-cache compression as a pure speed setting: draft compressed, verify full, tune online"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["draftkv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

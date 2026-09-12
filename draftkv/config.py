@@ -1,0 +1,71 @@
+"""Compression configuration and the arm space the controller searches over."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterator, Sequence
+
+
+@dataclass(frozen=True, order=True)
+class CompressionConfig:
+    """How aggressively the *drafter's* view of the KV cache is compressed.
+
+    Because DRAFTKV verifies every drafted token against the full-precision
+    cache, none of these knobs can change the emitted text.  They only change
+    how often the drafter guesses right (acceptance rate) and how fast a draft
+    step is (bytes moved).
+
+    bits:      quantization width for K and V entries (16 == no quantization).
+    keep_frac: fraction of context tokens the drafter is allowed to keep.
+    sink:      number of leading tokens always kept (attention sinks).
+    recent:    number of trailing tokens always kept (local window).
+    """
+
+    bits: int = 16
+    keep_frac: float = 1.0
+    sink: int = 4
+    recent: int = 32
+
+    def __post_init__(self) -> None:
+        if self.bits not in (2, 3, 4, 8, 16):
+            raise ValueError(f"unsupported bits={self.bits}")
+        if not 0.0 < self.keep_frac <= 1.0:
+            raise ValueError(f"keep_frac must be in (0, 1], got {self.keep_frac}")
+
+    @property
+    def lossless(self) -> bool:
+        return self.bits == 16 and self.keep_frac >= 1.0
+
+    def bytes_per_entry(self, d_head: int, group: int = 64) -> float:
+        """Bytes to store one (token, head) key or value vector.
+
+        Quantized storage is `bits` per element plus one fp16 scale and one
+        fp16 zero-point per group of `group` elements.
+        """
+        if self.bits == 16:
+            return 2.0 * d_head
+        groups = max(1, -(-d_head // group))
+        return d_head * self.bits / 8.0 + 4.0 * groups
+
+    def label(self) -> str:
+        b = "fp16" if self.bits == 16 else f"{self.bits}b"
+        return f"{b}/keep{self.keep_frac:g}"
+
+
+def default_arms(
+    bits: Sequence[int] = (2, 3, 4, 8, 16),
+    keep_fracs: Sequence[float] = (0.25, 0.5, 1.0),
+    sink: int = 4,
+    recent: int = 32,
+) -> list[CompressionConfig]:
+    """Cartesian arm space, deduplicated (fp16/keep1.0 is the only lossless arm)."""
+    seen: dict[tuple, CompressionConfig] = {}
+    for b in bits:
+        for k in keep_fracs:
+            c = CompressionConfig(bits=b, keep_frac=k, sink=sink, recent=recent)
+            seen.setdefault((b, k), c)
+    return sorted(seen.values())
+
+
+def gamma_range(gamma_max: int = 8) -> Iterator[int]:
+    return iter(range(1, gamma_max + 1))

@@ -1,0 +1,239 @@
+"""Experiments.  `python -m draftkv.bench all`"""
+
+from __future__ import annotations
+
+import argparse
+import time
+
+import numpy as np
+
+from .config import CompressionConfig, default_arms
+from .controller import FixedPolicy, FlatBandit, OraclePolicy, ThompsonController
+from .engine import DraftKVEngine
+from .model import demo_model
+from .sim import BanditEnv, plausible_alpha, run_bandit
+from .throughput import CostModel, best_gamma, expected_tokens
+
+LINE = "-" * 78
+
+
+def _h(t: str) -> None:
+    print(f"\n{LINE}\n{t}\n{LINE}")
+
+
+# ---------------------------------------------------------------- regimes
+def regimes() -> None:
+    _h("1. When is DRAFTKV worth turning on?  (ceiling = speedup at alpha->1)")
+    print("Both draft and verify stream the full weights, so weight traffic is a")
+    print("wash. Every saved byte is a KV byte -- the win only exists where KV")
+    print("traffic rivals weight traffic: long context, big batch, or offload.\n")
+    cfg = CompressionConfig(4, 0.5)
+    setups = [
+        ("HBM cache, batch 1", CostModel()),
+        ("HBM cache, batch 32", CostModel(batch=32)),
+        ("offloaded cache (PCIe5)", CostModel(full_kv_bandwidth=6.4e10, hbm_kv_budget=1.0e9)),
+    ]
+    print(f"{'setup':<26}" + "".join(f"{c:>13}" for c in ("ctx 1k", "ctx 32k", "ctx 256k")))
+    for name, cm in setups:
+        cells = []
+        for ctx in (1024, 32768, 262144):
+            g, t = best_gamma(cm, cfg, 0.9, ctx, 16)
+            cells.append(f"{cm.ceiling(cfg, ctx):>6.2f}x g*={g:<3}")
+        print(f"{name:<26}" + "".join(f"{c:>13}" for c in cells))
+    print("\nAt 1k context the ceiling is ~1.0: the controller must switch drafting")
+    print("off, and it does -- gamma*=0 falls out of the same argmax.")
+
+
+# ---------------------------------------------------------------- gamma math
+def gamma_curve() -> None:
+    _h("2. E(alpha, gamma) and the optimal draft length")
+    print("E saturates at 1/(1-alpha) while cost grows linearly in gamma, so")
+    print("gamma* is finite and rises steeply with alpha.\n")
+    cm = CostModel(full_kv_bandwidth=6.4e10, hbm_kv_budget=1.0e9)
+    print(f"{'alpha':>6}{'E(a,4)':>9}{'1/(1-a)':>10}{'gamma*':>8}{'speedup':>9}")
+    for a in (0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99):
+        g, t = best_gamma(cm, CompressionConfig(4, 0.5), a, 32768, 16)
+        print(f"{a:>6.2f}{expected_tokens(a, 4):>9.2f}{1/(1-a):>10.1f}{g:>8}{t*cm.t_baseline(32768):>9.2f}x")
+
+
+# ---------------------------------------------------------------- losslessness
+def losslessness(n_new: int = 40) -> None:
+    _h("3. Output identity: compression cannot change what is emitted")
+    m = demo_model()
+    rng = np.random.default_rng(0)
+    prompt = [int(x) for x in rng.integers(0, m.vocab_size, 256)]
+    base = DraftKVEngine(m, seed=0).generate_baseline(prompt, n_new, 0.0)
+    print(f"{'config':<16}{'gamma':>6}{'identical':>11}{'alpha_obs':>11}{'tok/verify':>12}")
+    for cfg in [CompressionConfig(16, 1.0), CompressionConfig(8, 1.0),
+                CompressionConfig(4, 1.0), CompressionConfig(4, 0.5),
+                CompressionConfig(2, 0.25)]:
+        for g in (4,):
+            r = DraftKVEngine(m, FixedPolicy(cfg, g), seed=0).generate(prompt, n_new, 0.0)
+            ok = "yes" if r.tokens == base else "NO"
+            print(f"{cfg.label():<16}{g:>6}{ok:>11}{r.acceptance_rate:>11.3f}{r.tokens_per_verify:>12.2f}")
+    print("\nSame tokens at 2 bits with 75% of the cache thrown away. That is the")
+    print("premise: quality is no longer a function of the compression setting.")
+
+
+# ---------------------------------------------------------------- controller
+def controller_study(rounds: int = 3000) -> None:
+    _h("4. Learning alpha(c) online -- factored vs flat bandit")
+    cm = CostModel(full_kv_bandwidth=6.4e10, hbm_kv_budget=1.0e9)
+    arms = default_arms()
+    alphas = {c: plausible_alpha(c) for c in arms}
+    env = BanditEnv(alphas, ctx=32768, seed=3)
+    opt_cfg, opt_g, opt_t = env.true_best(cm)
+    print(f"ground truth optimum: {opt_cfg.label()} gamma={opt_g} "
+          f"({opt_t*cm.t_baseline(env.ctx):.2f}x baseline), {len(arms)} configs\n")
+
+    fixed_scores = {
+        (c, g): run_bandit(FixedPolicy(c, g), BanditEnv(alphas, 32768, seed=3), cm, rounds)
+        for c in arms for g in (2, 4, 8)
+    }
+    (bc, bg), best_fixed = max(fixed_scores.items(), key=lambda kv: kv[1]["mean_throughput"])
+    mean_fixed = float(np.mean([v["mean_throughput"] for v in fixed_scores.values()]))
+
+    runs = {
+        "Thompson (factored)": ThompsonController(cm, arms, seed=1),
+        "Thompson, unpriced switch": ThompsonController(cm, arms, switch_amortize=10**9, seed=1),
+        "Thompson, hard 32-commit": ThompsonController(cm, arms, commit_rounds=32, seed=1),
+        "flat bandit (c,gamma)": FlatBandit(cm, arms, seed=1),
+        "oracle": OraclePolicy(cm, alphas),
+    }
+    print(f"{'policy':<24}{'speedup':>9}{'% of opt':>10}{'switches':>10}{'final pick':>20}")
+    base = cm.t_baseline(env.ctx)
+    print(f"{'best fixed (hindsight)':<24}{best_fixed['mean_throughput']*base:>9.2f}x"
+          f"{100*best_fixed['mean_throughput']/opt_t:>9.1f}%{0:>10}"
+          f"{bc.label() + ' g=' + str(bg):>20}")
+    print(f"{'avg fixed (no hindsight)':<24}{mean_fixed*base:>9.2f}x"
+          f"{100*mean_fixed/opt_t:>9.1f}%{0:>10}{'-':>20}")
+    for name, ctrl in runs.items():
+        out = run_bandit(ctrl, BanditEnv(alphas, ctx=32768, seed=3), cm, rounds)
+        cfg, g = out["final_pick"]
+        print(f"{name:<24}{out['mean_throughput']*cm.t_baseline(env.ctx):>9.2f}x"
+              f"{100*out['mean_throughput']/opt_t:>9.1f}%"
+              f"{out['switches']:>10}"
+              f"{cfg.label() + ' g=' + str(g):>20}")
+    warm = ThompsonController(cm, arms, seed=1)
+    run_bandit(warm, BanditEnv(alphas, 32768, seed=3), cm, 3000)
+    tail = run_bandit(warm, BanditEnv(alphas, 32768, seed=3), cm, 1000)
+    print(f"{'Thompson, after warm-up':<24}{tail['mean_throughput']*base:>9.2f}x"
+          f"{100*tail['mean_throughput']/opt_t:>9.1f}%{tail['switches']:>10}"
+          f"{tail['final_pick'][0].label() + ' g=' + str(tail['final_pick'][1]):>20}")
+    print("\nRead this honestly: in a *stationary* world a fixed config chosen with")
+    print("hindsight is already near-optimal, and the bandit cannot beat it while it")
+    print("is still exploring -- the cold-start row pays a real tax. Its case is that")
+    print("it lands on that arm without hindsight, stays far above the config you")
+    print("would pick blind throughout, and keeps working when the content changes")
+    print("(experiment 5), which no fixed choice does.")
+    print("The flat bandit explores |C|x|gamma| arms to learn a quantity that only")
+    print("depends on c; solving gamma from the cost model instead is the single")
+    print("largest structural win in the controller.")
+
+
+def nonstationary(rounds: int = 4000) -> None:
+    _h("5. Content shift: prose -> code halfway through")
+    # Budget tight enough that the *argmax* moves with content, not just the
+    # margin -- otherwise "tracking" is untestable and the experiment is theater.
+    cm = CostModel(full_kv_bandwidth=6.4e10, hbm_kv_budget=3.0e8)
+    arms = default_arms()
+    easy = {c: plausible_alpha(c, 0.3) for c in arms}     # tolerant content
+    hard = {c: plausible_alpha(c, 2.0) for c in arms}     # brittle content
+    print(f"optimum on tolerant content: {BanditEnv(easy, 32768).true_best(cm)[0].label()}  ->  "
+          f"on brittle content: {BanditEnv(hard, 32768).true_best(cm)[0].label()}\n")
+    for label, decay in (("decay=1.0 (no forgetting)", 1.0), ("decay=0.97", 0.97)):
+        ctrl = ThompsonController(cm, arms, decay=decay, seed=2)
+        picks = []
+        for phase, alphas in (("easy", easy), ("hard", hard)):
+            out = run_bandit(ctrl, BanditEnv(alphas, ctx=32768, seed=4), cm, rounds // 2)
+            picks.append((phase, out["final_pick"], out["mean_throughput"] / out["optimal_throughput"]))
+        s = "  ".join(f"{p}: {c.label()} g={g} ({f:.0%} of opt)" for p, (c, g), f in picks)
+        print(f"{label:<28}{s}")
+    print("\nA stale posterior keeps drafting aggressively into content that no")
+    print("longer tolerates it. Discounting the Beta counts is what makes the")
+    print("controller a tracker rather than an estimator -- but note it only")
+    print("recovers part of the gap inside this window, and it costs a little")
+    print("in a stationary world. Forgetting is a tuned trade, not a free win.")
+
+
+def context_gating() -> None:
+    _h("6. Self-gating by context length")
+    cm = CostModel(full_kv_bandwidth=6.4e10, hbm_kv_budget=1.0e9)
+    arms = default_arms()
+    alphas = {c: plausible_alpha(c) for c in arms}
+    print(f"{'ctx':>8}{'pick':>22}{'gamma':>7}{'predicted speedup':>20}")
+    for ctx in (128, 512, 2048, 8192, 32768, 131072):
+        ctrl = ThompsonController(cm, arms, seed=5)
+        for _ in range(400):
+            cfg, g = ctrl.select(ctx)
+            if g:
+                ctrl.update(cfg, g, BanditEnv(alphas, ctx, seed=6).pull(cfg, g), ctx)
+        cfg, g, t = ctrl.best_known(ctx)
+        sp = t * cm.t_baseline(ctx)
+        gate = g if sp >= ctrl.min_speedup else 0
+        print(f"{ctx:>8}{cfg.label():>22}{gate:>7}{sp:>19.2f}x")
+    print("\nTwo separate effects, worth not conflating:")
+    print(" * short context -> the predicted win falls under the gate, and the")
+    print("   controller declines to draft at all (gamma=0).")
+    print(" * mid context   -> the drafter's mirror fits in HBM uncompressed, so")
+    print("   the right answer is self-speculation with *no* compression.")
+    print("   Compression only starts earning its keep once the mirror stops")
+    print("   fitting, which is the trade the memory budget actually encodes.")
+
+
+def end_to_end(n_new: int = 240) -> None:
+    _h("7. End to end on the reference model")
+    m = demo_model()
+    cm = CostModel(n_layers=m.n_layers, n_kv_heads=m.n_heads, d_head=m.d_head,
+                   weight_bytes=2.0e6, full_kv_bandwidth=6.4e8, bandwidth=2.0e10,
+                   hbm_kv_budget=2.0e5)
+    rng = np.random.default_rng(7)
+    prompt = [int(x) for x in rng.integers(0, m.vocab_size, 512)]
+    base = DraftKVEngine(m, seed=0).generate_baseline(prompt, n_new, 0.0)
+
+    ctrl = ThompsonController(cm, default_arms(), gamma_max=8, seed=11)
+    t0 = time.perf_counter()
+    r = DraftKVEngine(m, ctrl, seed=0).generate(prompt, n_new, 0.0)
+    wall = time.perf_counter() - t0
+    print(f"identical to full-KV decoding : {r.tokens == base}")
+    print(f"verify passes / new tokens    : {r.verify_passes} / {r.new_tokens} "
+          f"({r.tokens_per_verify:.2f} tokens per pass)")
+    print(f"observed acceptance rate      : {r.acceptance_rate:.3f}")
+    print(f"drafter cache rebuilds        : {r.cache_rebuilds} (config switches over {len(r.rounds)} rounds)")
+    print(f"numpy wall clock              : {wall:.2f}s (reference impl, not a speed claim)")
+    print("\nNote the round count: 15 arms over a few dozen rounds is squarely in")
+    print("the exploration phase, so the alphas below are not converged. This")
+    print("experiment demonstrates correctness under a live controller; experiment")
+    print("4 is where convergence is measured.")
+    print("\nlearned alpha per config:")
+    for cfg, a in sorted(ctrl.alpha_estimates().items()):
+        print(f"  {cfg.label():<16}{a:.3f}")
+    used = {}
+    for rd in r.rounds:
+        used[rd.cfg.label()] = used.get(rd.cfg.label(), 0) + 1
+    top = sorted(used.items(), key=lambda x: -x[1])[:5]
+    print("\nmost played configs:", ", ".join(f"{k} x{v}" for k, v in top))
+
+
+ALL = {
+    "regimes": regimes,
+    "gamma": gamma_curve,
+    "lossless": losslessness,
+    "controller": controller_study,
+    "nonstationary": nonstationary,
+    "gating": context_gating,
+    "e2e": end_to_end,
+}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="DRAFTKV experiments")
+    ap.add_argument("which", nargs="?", default="all", choices=["all", *ALL])
+    a = ap.parse_args()
+    for name, fn in ALL.items():
+        if a.which in ("all", name):
+            fn()
+
+
+if __name__ == "__main__":
+    main()
