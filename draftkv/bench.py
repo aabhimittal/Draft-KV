@@ -263,18 +263,23 @@ def layer_allocation(n_new: int = 160) -> None:
     _h("9. Per-layer bit allocation beats uniform compression at equal bytes")
     m = demo_model()
     rng = np.random.default_rng(0)
-    prompt = [int(x) for x in rng.integers(0, m.vocab_size, 320)]
+    # several prompts, not one: a single-prompt profile measures the prompt
+    prompts = [[int(x) for x in rng.integers(0, m.vocab_size, 320)] for _ in range(3)]
+    prompt = prompts[0]
     cands = [CompressionConfig(2, 0.5), CompressionConfig(3, 0.5),
              CompressionConfig(4, 1.0), CompressionConfig(8, 1.0)]
-    prof = profile_layers(m, prompt, cands, n_new=n_new)
+    prof = profile_layers(m, prompts, cands, n_new=n_new)
 
     print("acceptance with ONE layer degraded (others fp16):")
     print(f"{'layer':>6}" + "".join(f"{c.label():>14}" for c in cands))
     for L in range(m.n_layers):
         print(f"{L:>6}" + "".join(f"{prof.alpha[(L, c)]:>14.2f}" for c in cands))
-    print(f"\nSame bits, very different cost. (min drafted tokens behind any cell:"
-          f" {prof.min_trials}; below ~200 the profile is too noisy to rank"
-          f" neighbouring configs, and the allocation degrades with it.)")
+    print(f"\nSame bits, very different cost. Profiled over {prof.n_prompts} prompts;"
+          f" min drafted tokens behind a cell: {prof.min_trials},"
+          f" sd(log alpha) across prompts: {prof.noise:.2f}.")
+    print("A damage smaller than that sd is not a measurement. On distilgpt2 the")
+    print("same figure is ~1.2, which is why the real-model profile is only")
+    print("trustworthy as a ranking (experiment 11).")
 
     nkv, dh, ctx = m.n_heads, m.d_head, 400
     ub = lambda c: LayerPlan.uniform(c, m.n_layers).per_layer_bytes(ctx, nkv, dh)
@@ -291,10 +296,15 @@ def layer_allocation(n_new: int = 160) -> None:
               f"{uc.label():<12}"
               f"{measure_alpha(m, prompt, LayerPlan.uniform(uc, m.n_layers), n_new=n_new):>7.3f}")
     print("\nTwo things had to be right for this to work.")
-    print(" * The objective: per-layer damages are assumed to add in log-acceptance.")
-    print("   That is a decent ordering and a poor absolute predictor -- it")
-    print("   over-estimates damage once several layers are degraded at once -- so")
-    print("   the tests pin the ordering, not the prediction.")
+    print(" * The objective: how per-layer damages compose. Log-additivity is the")
+    print("   obvious guess and it is wrong in *both* directions depending on the")
+    print("   model -- it over-predicts damage here (errors overlap) and")
+    print("   under-predicts it on distilgpt2 (errors amplify). `SensitivityProfile.p`")
+    print("   generalizes it to a power mean and `fit_composition` fits that one")
+    print("   scalar from measured mixed plans, searching across p = 1 rather than")
+    print("   assuming a side. The optimizer is untouched: minimizing")
+    print("   (sum D**p)**(1/p) is minimizing sum D**p, still separable.")
+    print("   The tests pin the ordering, not the absolute prediction.")
     print(" * The optimizer: greedy over adjacent upgrades is not optimal, though on")
     print("   this particular profile it happens to find the same plans -- the")
     print("   damages here are smoothly graded, which is the easy case. It breaks")
@@ -304,6 +314,106 @@ def layer_allocation(n_new: int = 160) -> None:
     print("   (test_exact_dp_beats_greedy_on_its_failure_mode pins that). Exact")
     print("   knapsack DP over the Pareto frontier is optimal either way, and")
     print("   recovers the uniform plan whenever uniform genuinely is best.")
+
+
+def real_model(n_new: int = 24) -> None:
+    _h("10. On a real open-source model (distilgpt2)")
+    try:
+        from .gpt2 import load_real_model
+        m, tok = load_real_model()
+    except Exception as e:                                   # noqa: BLE001
+        print(f"skipped: {e}")
+        print("run `python scripts/fetch_model.py` to enable this experiment.")
+        return
+
+    text = ("Memory bandwidth, not arithmetic, is the binding constraint on modern "
+            "inference hardware. Every generation of accelerator widens the gap "
+            "between compute throughput and the rate at which parameters can be "
+            "delivered, and every generation of software invents a new way to hide "
+            "it: caching, tiling, quantisation, speculation. ") * 4
+    ids = tok.encode(text)[:256]
+    base = DraftKVEngine(m, seed=0).generate_baseline(list(ids), n_new, 0.0)
+    print(f"prompt {len(ids)} tokens; baseline continues:\n  {tok.decode(base[len(ids):])!r}\n")
+
+    print(f"{'config':<14}{'identical':>11}{'alpha':>8}{'tok/verify':>12}")
+    for cfg in (CompressionConfig(16, 1.0), CompressionConfig(8, 1.0),
+                CompressionConfig(4, 1.0), CompressionConfig(4, 0.5),
+                CompressionConfig(2, 0.25)):
+        r = DraftKVEngine(m, FixedPolicy(cfg, 4), seed=0).generate(list(ids), n_new, 0.0)
+        ok = "yes" if r.tokens == base else "NO"
+        print(f"{cfg.label():<14}{ok:>11}{r.acceptance_rate:>8.3f}{r.tokens_per_verify:>12.2f}")
+
+    print("\nTwo things the random-weight model got wrong, and one it got right:")
+    print(" * Quantization is close to free: 8-bit is exact and 4-bit stays high")
+    print("   (0.86-1.00 depending on the prompt), where the toy model put 4-bit at")
+    print("   0.66. Real KV caches are far more quantization-tolerant than a")
+    print("   random-weight proxy suggests.")
+    print(" * Eviction is the damaging axis: dropping tokens is what collapses")
+    print("   acceptance, not narrowing them. So on a real model the budget worth")
+    print("   allocating per layer is tokens, not bits.")
+    print(" * Losslessness holds exactly, which is the part that had to transfer.")
+    print("\nNote how much the numbers move with the prompt -- that is not incidental,")
+    print("it is the dominant effect, and experiment 11 measures it.")
+
+
+def prompt_dependence() -> None:
+    _h("11. Acceptance is a property of the content, not just the config")
+    try:
+        from .gpt2 import load_real_model
+        m, tok = load_real_model()
+    except Exception as e:                                   # noqa: BLE001
+        print(f"skipped: {e}")
+        return
+
+    prompts = {
+        "tech":  "Memory bandwidth, not arithmetic, is the binding constraint on modern "
+                 "inference hardware. Every generation of accelerator widens the gap. ",
+        "prose": "She had not expected the letter to arrive so late in the season, nor to "
+                 "find it waiting on the hall table beneath a pile of unopened bills. ",
+        "code":  "def merge(left, right):\n    out = []\n    i = j = 0\n    while i < "
+                 "len(left) and j < len(right):\n        out.append(left[i]); i += 1\n",
+        "list":  "1. Preheat the oven. 2. Combine the flour and butter. 3. Add cold water. "
+                 "4. Rest the dough. 5. Roll it out thinly. 6. Line the tin. ",
+    }
+    ref, probe = CompressionConfig(4, 1.0), CompressionConfig(4, 0.25)
+    print(f"acceptance with ONE layer evicted to {probe.label()}, others {ref.label()}:\n")
+    print(f"{'prompt':<7}{'ref':>7}" + "".join(f"{'L' + str(i):>7}" for i in range(m.n_layers))
+          + "   most sensitive")
+    rows = {}
+    for name, text in prompts.items():
+        ids = tok.encode(text * 6)[:288]
+        a_ref = measure_alpha(m, ids, LayerPlan.uniform(ref, m.n_layers), 6, 96, 0)
+        row = []
+        for L in range(m.n_layers):
+            cfgs = [ref] * m.n_layers
+            cfgs[L] = probe
+            row.append(measure_alpha(m, ids, LayerPlan(tuple(cfgs)), 6, 96, 0))
+        rows[name] = row
+        # a tie is not a winner: only name a layer when the spread is real
+        worst = f"L{int(np.argmin(row))}" if (max(row) - min(row)) > 0.02 else "-- (flat)"
+        print(f"{name:<7}{a_ref:>7.2f}" + "".join(f"{v:>7.2f}" for v in row)
+              + f"   {worst}")
+
+    def spearman(a, b) -> float:
+        ra, rb = np.argsort(np.argsort(a)), np.argsort(np.argsort(b))
+        if np.std(ra) == 0 or np.std(rb) == 0:
+            return float("nan")
+        return float(np.corrcoef(ra, rb)[0, 1])
+
+    live = [k for k, v in rows.items() if max(v) - min(v) > 0.02]
+    print("\nrank agreement between prompts that show any spread:")
+    for i, a in enumerate(live):
+        for b in live[i + 1:]:
+            print(f"  {a:>5} vs {b:<5} rho={spearman(rows[a], rows[b]):+.2f}")
+
+    print("\nRead the columns, not the rows. The absolute numbers swing enormously")
+    print("with content -- the same plan can measure ~0.95 on one passage and ~0.10")
+    print("on another, and a passage may show no sensitivity at all -- but layer 0")
+    print("is the most sensitive layer on every prompt that has a most-sensitive")
+    print("layer, and the orderings agree.")
+    print("\nSo the offline profile is a *ranking* device and nothing more. That is")
+    print("all the allocator consumes, which is lucky, because the absolute damage")
+    print("prediction does not survive a change of content.")
 
 
 ALL = {
@@ -316,6 +426,8 @@ ALL = {
     "e2e": end_to_end,
     "depth": depth_profile,
     "layers": layer_allocation,
+    "real": real_model,
+    "prompts": prompt_dependence,
 }
 
 
