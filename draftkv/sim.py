@@ -126,3 +126,42 @@ def run_bandit(
         final_pick=picks[-1],
         picks=picks,
     )
+
+
+@dataclass
+class LayerEnv:
+    """Simulated environment with a known per-layer sensitivity, for testing
+    the adaptive allocator without paying for model runs.
+
+    Acceptance for a plan is the reference rate discounted by each layer's
+    damage at the config it was given, composed log-additively (which the
+    real-model measurements support once the profile is averaged properly).
+    `shift()` moves the sensitivity to a different layer, which is the case a
+    static offline profile cannot handle and an online one should.
+    """
+
+    damage: dict[int, float]            # layer -> damage at the cheapest config
+    ranked: Sequence[CompressionConfig]  # cheapest first
+    alpha_ref: float = 0.95
+    ctx: int = 32768
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        self.rng = np.random.default_rng(self.seed)
+
+    def alpha(self, plan) -> float:
+        total = 0.0
+        for L, c in enumerate(plan):
+            notches = len(self.ranked) - 1 - list(self.ranked).index(c)
+            total += self.damage.get(L, 0.0) * notches / max(1, len(self.ranked) - 1)
+        return float(np.clip(self.alpha_ref * np.exp(-total), 0.01, 0.999))
+
+    def pull(self, plan, gamma: int) -> int:
+        a = self.alpha(plan)
+        k = 0
+        while k < gamma and self.rng.random() < a:
+            k += 1
+        return k
+
+    def shift(self, damage: dict[int, float]) -> None:
+        self.damage = damage

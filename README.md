@@ -18,8 +18,8 @@ with the losslessness claim as an executable test rather than an assertion.
 
 ```bash
 pip install -e .
-python -m draftkv.bench all      # eleven experiments
-pytest -q                        # 86 tests
+python -m draftkv.bench all      # fourteen experiments
+pytest -q                        # 106 tests
 
 python scripts/fetch_model.py    # optional: distilgpt2, enables the real-model work
 ```
@@ -281,6 +281,115 @@ a dozen noisy points is not evidence, and the honest first question about a
 model that predicts badly is whether the thing it is predicting was measured
 well enough to predict.
 
+## Is the early-layer result a small-model artifact?
+
+The most actionable finding here -- sensitivity concentrating in the first
+layers -- was measured on a 6-layer model, which is exactly the shape of thing
+that turns out to be an artifact. Checking it against depth, same probe
+(one layer evicted to keep-0.25, others at 4-bit full), averaged over three
+prompts:
+
+| model | layers | most sensitive | share of damage in first 25% of stack |
+|---|---|---|---|
+| distilgpt2 | 6 | L0, L3, L5 | 62% |
+| gpt2 | 12 | L1, L0, L11 | 94% |
+| gpt2-medium | 24 | L1, L2, L3 | **100%** |
+
+The concentration does not wash out with depth, it *sharpens*. At 24 layers,
+every layer past the third is indistinguishable from lossless under this probe
+while layers 1 and 2 carry damages of 3.02 and 2.11.
+
+Two corrections to how I stated this before:
+
+- It is **early layers**, not literally layer 0. On gpt2-medium layer 0 measures
+  0.00 and the damage sits in layers 1-2.
+- The deep tail is not merely tolerant, it is *flat*. Several layers measure
+  slightly negative damage, i.e. indistinguishable from zero at this noise
+  level, which is what makes the allocation win large.
+
+**What this still does not establish.** All three are GPT-2 family, all under
+1B, all learned-positional / MHA / GELU. A 7B model is untested, and so is any
+architecture with rotary embeddings, grouped-query attention or SwiGLU -- the
+things every current model actually uses. The trend across 6 -> 12 -> 24 layers
+is evidence against the artifact hypothesis, not a demonstration that it holds
+at scale.
+
+## Allocating the layer budget online
+
+The measured prompt-dependence above undermines the static allocator: a profile
+taken once is a prior, not an answer. `AdaptiveLayerController` keeps the same
+objective and the same exact knapsack but sources its damages from the live
+verify pass.
+
+The reason it may explore *in production* is the premise of the whole project:
+**output is identical whatever the plan**, so a probe costs a little throughput
+and cannot corrupt anything. An allocator for a compressor that traded against
+quality could never do this.
+
+Against a simulated content shift, at a fixed byte budget:
+
+| | true sensitive layer | found | acceptance |
+|---|---|---|---|
+| content A | 1 | 1 | **0.95** |
+| content B (shifted) | 4 | 4 | **0.95** |
+| fixed uniform plan, same budget | — | — | 0.27 on content B |
+
+Two design errors surfaced while building it, both now regression tests:
+
+- **Probing only downward starves the layers that matter.** A layer at the
+  floor cannot be degraded further, so as the plan compresses, the layers most
+  in need of measurement become unmeasurable. Replaced with **swap probes** —
+  a notch taken from one layer and given to another, always feasible and
+  byte-neutral by construction. A first cut at this chose swap partners by
+  position rather than bytes; notch sizes are not uniform (keep 0.5 → 1.0 costs
+  twice keep 0.25 → 0.5), so ~80% of probes were silently over budget and
+  rejected.
+- **Separate up/down posteriors measure staleness, not sensitivity.** A layer
+  pinned at the ceiling never gets an "up" observation and one at the floor
+  never gets a "down" one, so the comparison between the two sides drifts into
+  comparing their ages. In testing this assigned a shifted sensitivity to
+  entirely the wrong layer. Replaced with **paired comparison**: each swap
+  scores against the concurrent base rate and credits `+delta` to the layer
+  that gained and `-delta` to the one that paid, touching both regardless of
+  where they sit.
+
+A third failure was structural: with no information the knapsack has nothing to
+minimize, so it returns the *cheapest* feasible plan, acceptance collapses, the
+gate switches drafting off — and with `gamma = 0` no round reports anything, so
+the controller can never recover. Fixed by spending surplus budget (unspent
+bytes buy nothing, so "no information" should mean "compress as little as the
+budget forces") and by treating a run of gated rounds as evidence against the
+plan rather than a steady state.
+
+## Rollback under a paged cache
+
+The hard part of a vLLM integration was never the math: it is that the
+authoritative cache lives in a paged pool addressed through block tables, and
+DRAFTKV rewinds it once per verify pass. On a contiguous array a rewind is a
+slice; in a pool it means freeing whole blocks, keeping a partially filled tail,
+and doing that every round without leaking.
+
+`draftkv/paged.py` implements that allocator — fixed block pool, per-layer block
+tables, slot addressing — and the engine's full cache is now swappable, so it
+runs end to end:
+
+| block size | blocks used | fragmentation | output identical |
+|---|---|---|---|
+| 4 | 168 | 0.4% | yes |
+| 16 | 42 | 0.4% | yes |
+| 64 | 12 | 12.9% | yes |
+
+Identical tokens at every block size, with a rollback every round, no leaked
+blocks, and pool invariants asserted after each one. `test_repeated_rollback_cycles_do_not_leak`
+runs 60 reject-everything rounds, because a one-block-per-round leak would
+exhaust any pool in production and pass a single-shot test.
+
+**Be clear about what this is not.** There is no CUDA, no real paged-attention
+kernel, no CUDA-graph capture, and no vLLM patch. What it establishes is that
+the rollback contract survives block-table indirection — the part that would
+otherwise be discovered late and expensively. The remaining integration work is
+real and untouched.
+
 ## Two corrections the measurements forced
 
 The first version of this took the problem statement's model at face value: one
@@ -407,10 +516,12 @@ Two subtleties that are easy to get wrong and are handled explicitly:
 | `throughput.py` | `E(alpha, gamma)`, the depth-indexed `E`, the memory-traffic cost model, `ceiling()`, `best_gamma` |
 | `controller.py` | Thompson sampling (pooled and depth-indexed), flat-product baseline, oracle, fixed policies |
 | `layers.py` | multi-prompt sensitivity profiling, composition model, exact-knapsack allocation |
-| `gpt2.py` | distilgpt2 in numpy (safetensors reader, BPE), behind the same cache contract |
+| `gpt2.py` | distilgpt2 / gpt2 / gpt2-medium in numpy (safetensors, BPE), same cache contract |
+| `adaptive.py` | online per-layer allocation via budget-neutral swap probes |
+| `paged.py` | block-paged authoritative cache with rollback, the vLLM-shaped part |
 | `scripts/fetch_model.py` | optional checkpoint download; real-model tests skip without it |
 | `sim.py` | bandit environment with known ground-truth `alpha(c)` |
-| `bench.py` | the eleven experiments |
+| `bench.py` | the fourteen experiments |
 | `.github/workflows/tests.yml` | CI: full suite on Python 3.10-3.13, losslessness as a separate fast lane |
 
 The reference model has random weights, so the text is gibberish — irrelevant,
@@ -428,10 +539,11 @@ losslessness test vacuous.
   or eager mode — one reason to quantize `gamma` to a handful of values). The
   cost model is written so those costs can be measured and substituted rather
   than assumed.
-- **No large-model numbers.** distilgpt2 is real but small (6 layers, 82M).
-  Its per-layer sensitivity concentrating in layer 0 may or may not hold at
-  scale, and `sim.plausible_alpha` remains a stylized shape for the simulator,
-  not a calibration.
+- **No large-model numbers, and no modern architecture.** The scaling check
+  covers 6 -> 12 -> 24 layers, all GPT-2 family, all under 1B. Rotary
+  embeddings, grouped-query attention and SwiGLU are untested, as is anything
+  at 7B. `sim.plausible_alpha` remains a stylized shape for the simulator, not
+  a calibration.
 - **No claim that this is VeriCache.** It implements the mechanism the idea
   describes, and specifically does not assume the paper's handling of where the
   full cache lives — that is modeled explicitly here as a bandwidth and budget

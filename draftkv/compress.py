@@ -206,6 +206,29 @@ class CompressedKVCache:
             rows += int(sel.size)
         return rows
 
+    def rebuild_layers(self, full: FullKVCache, layers, cfgs=None) -> int:
+        """Requantize only the named layers, optionally under new configs.
+
+        A swap probe changes two layers, not all of them. Rebuilding the whole
+        mirror for that costs O(n_layers * ctx) when O(2 * ctx) would do, and at
+        long context the difference decides whether online probing is affordable
+        at all. Returns rows rewritten.
+        """
+        rows = 0
+        for L in layers:
+            if cfgs is not None:
+                self.cfgs[L] = cfgs[L]
+            self.k[L].clear()
+            self.v[L].clear()
+            self.pos[L].clear()
+            self.score[L].clear()
+            k, v, pos = full.read(L)
+            if pos.size:
+                self.append(L, k, v, pos)
+                rows += int(pos.size)
+        self.cfg = self.cfgs[0]
+        return rows
+
     @property
     def length(self) -> int:
         return len(self.pos[0])
