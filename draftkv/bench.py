@@ -558,6 +558,107 @@ def depth_scaling() -> None:
     print("remains unverified.")
 
 
+def gqa_ceiling() -> None:
+    _h("15. GQA has already eaten most of what DRAFTKV wants to save")
+    print("The speedup ceiling is a ratio of memory traffic. Grouped-query")
+    print("attention shrinks the KV cache by its ratio, so it removes most of the")
+    print("KV traffic before DRAFTKV gets to compress any of it. This is the")
+    print("single largest consequence of testing on a modern architecture, and it")
+    print("is a negative one.\n")
+
+    cfg = CompressionConfig(4, 0.5)
+    base = dict(n_layers=32, d_head=128, weight_bytes=16e9, bandwidth=2.0e12)
+
+    def breakeven(n_kv, target=1.5, **kw):
+        cm = CostModel(n_kv_heads=n_kv, **base, **kw)
+        lo, hi = 128, 8_000_000
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if cm.ceiling(cfg, mid) >= target:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    rows = [("MHA (32 kv heads)", 32), ("GQA 4:1 (8 kv)", 8),
+            ("GQA 8:1 (4 kv)", 4), ("MQA (1 kv)", 1)]
+    print(f"{'attention':<22}{'ctx for 1.5x ceiling':>22}{'offloaded cache':>18}")
+    for name, kv in rows:
+        off = breakeven(kv, full_kv_bandwidth=6.4e10, hbm_kv_budget=1e9)
+        print(f"{name:<22}{breakeven(kv):>21,}{off:>18,}")
+
+    print(f"\n{'ceiling at fixed context':<26}{'MHA':>10}{'GQA 4:1':>10}")
+    for ctx in (32768, 131072, 524288):
+        mha = CostModel(n_kv_heads=32, **base).ceiling(cfg, ctx)
+        gqa = CostModel(n_kv_heads=8, **base).ceiling(cfg, ctx)
+        print(f"  ctx {ctx:>7,}{'':<12}{mha:>9.2f}x{gqa:>9.2f}x")
+
+    print("\nBreak-even moves out by roughly the GQA ratio. On an HBM-resident")
+    print("cache with 4:1 GQA you need ~77k tokens before a 1.5x ceiling exists at")
+    print("all, and 8:1 pushes that past 150k. Offloading the full cache is what")
+    print("rescues it -- there the break-even is a couple of thousand tokens even")
+    print("under GQA, because the comparison is against PCIe rather than HBM.")
+    print("\nSo on a current model the honest pitch is narrower than it was on")
+    print("GPT-2: long context, or an offloaded cache, and not much else.")
+
+
+def modern_architectures(n_new: int = 16) -> None:
+    _h("16. Does any of it survive RoPE, GQA, RMSNorm and SwiGLU?")
+    from pathlib import Path
+
+    from .llama import demo_llama, load_llama
+
+    print("Structural check first, on a random-weight Llama-style model, so this")
+    print("runs without a download:\n")
+    for n_kv in (8, 2, 1):
+        m = demo_llama(n_heads=8, n_kv_heads=n_kv, seed=2)
+        prompt = [int(x) for x in np.random.default_rng(0).integers(0, m.vocab_size, 96)]
+        base = DraftKVEngine(m, seed=0).generate_baseline(prompt, n_new, 0.0)
+        ok = all(
+            DraftKVEngine(m, FixedPolicy(c, 4), seed=0).generate(prompt, n_new, 0.0).tokens == base
+            for c in (CompressionConfig(8, 1.0), CompressionConfig(4, 0.5),
+                      CompressionConfig(2, 0.25))
+        )
+        cache = m.new_cache()
+        m.forward(np.arange(16) % m.vocab_size, cache, 0)
+        print(f"  GQA {m.n_heads // m.n_kv_heads}:1  cache K shape {cache.read(0)[0].shape}"
+              f"   lossless at every config: {ok}")
+    print("\nThe cache stores KV heads, not query heads, and nothing in the engine,")
+    print("controller, allocator or paged pool needed to change.")
+
+    for name in ("smollm2-135m", "qwen2.5-0.5b"):
+        d = Path.home() / ".cache" / "draftkv" / name
+        if not (d / "model.safetensors").exists():
+            print(f"\n  {name}: not downloaded")
+            continue
+        m, tok = load_llama(d)
+        ids = tok.encode("Memory bandwidth, not arithmetic, is the binding constraint on "
+                         "modern inference hardware. Every generation widens the gap. ") * 3
+        ids = ids[:192]
+        base = DraftKVEngine(m, seed=0).generate_baseline(list(ids), n_new, 0.0)
+        print(f"\n  {name} ({m.n_layers}L, GQA {m.n_heads // m.n_kv_heads}:1)")
+        print(f"    {'config':<14}{'identical':>11}{'alpha':>8}")
+        for cfg in (CompressionConfig(8, 1.0), CompressionConfig(4, 1.0),
+                    CompressionConfig(4, 0.5)):
+            r = DraftKVEngine(m, FixedPolicy(cfg, 4), seed=0).generate(list(ids), n_new, 0.0)
+            print(f"    {cfg.label():<14}{('yes' if r.tokens == base else 'NO'):>11}"
+                  f"{r.acceptance_rate:>8.3f}")
+
+    print("\nLosslessness transfers, which is the part that had to. Two things that")
+    print("were presented as findings on GPT-2 do NOT transfer, and the honest")
+    print("summary is that both were family-specific:")
+    print(" * 8-bit is exact on distilgpt2 but costs acceptance on Qwen2.5, whose")
+    print("   activation outliers are harder to quantize.")
+    print(" * the early-layer sensitivity concentration is a GPT-2 property. Only")
+    print("   11% (SmolLM2) and 27% (Qwen2.5) of damage sits in the first quarter")
+    print("   of the stack, against 62-100% for GPT-2 (experiment 14), the most")
+    print("   sensitive layers are mid-stack, and the largest single-layer damage")
+    print("   is 0.07-0.09 against 3.02 on gpt2-medium.")
+    print("There is far less per-layer structure to exploit on a current model.")
+    print("That argues for the adaptive allocator over a static profile, and")
+    print("against quoting either set of numbers as a property of KV caches.")
+
+
 ALL = {
     "regimes": regimes,
     "gamma": gamma_curve,
@@ -573,6 +674,8 @@ ALL = {
     "adaptive": adaptive_allocation,
     "paged": paged_cache,
     "scaling": depth_scaling,
+    "gqa": gqa_ceiling,
+    "modern": modern_architectures,
 }
 
 
