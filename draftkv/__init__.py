@@ -17,7 +17,9 @@ from .controller import (
 )
 from .engine import DraftKVEngine, GenerationResult
 from .model import TinyTransformer
+from .adaptive import AdaptiveLayerController
 from .layers import SensitivityProfile, allocate, measure_alpha, profile_layers
+from .paged import BlockPool, BlockPoolExhausted, PagedKVCache
 from .throughput import (
     CostModel,
     best_gamma,
@@ -28,6 +30,9 @@ from .throughput import (
 
 __all__ = [
     "CompressedKVCache",
+    "AdaptiveLayerController",
+    "BlockPool",
+    "BlockPoolExhausted",
     "CompressionConfig",
     "CostModel",
     "DepthThompsonController",
@@ -38,6 +43,7 @@ __all__ = [
     "GenerationResult",
     "LayerPlan",
     "OraclePolicy",
+    "PagedKVCache",
     "SensitivityProfile",
     "ThompsonController",
     "TinyTransformer",

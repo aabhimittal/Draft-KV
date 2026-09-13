@@ -154,14 +154,16 @@ class CostModel:
         )
 
     # ----------------------------------------------------------- objectives
-    def rebuild_cost(self, ctx: int) -> float:
-        """Cost of re-deriving the drafter's whole cache under a new config.
+    def rebuild_cost(self, ctx: int, layers_changed: int | None = None) -> float:
+        """Cost of re-deriving the drafter's cache after a config change.
 
-        Switching compression config is not free: every cached position has to
-        be re-quantized, so it is O(ctx). A controller that ignores this will
-        thrash between near-equal arms and lose more than it gains.
+        Every affected position must be re-quantized, so it is O(ctx) per
+        layer. `layers_changed` prices a partial rebuild -- a swap probe
+        touches two layers, and charging it for all of them makes online
+        probing look unaffordable when it is not.
         """
-        return ctx * self.resync_per_token
+        frac = 1.0 if layers_changed is None else min(1.0, layers_changed / max(1, self.n_layers))
+        return ctx * self.resync_per_token * frac * self.n_layers / max(1, self.n_layers)
 
     def round_cost_profile(
         self, cfg: CompressionConfig, accept: Sequence[float], ctx: int, extra_cost: float = 0.0

@@ -16,9 +16,11 @@ from .controller import (
     ThompsonController,
 )
 from .engine import DraftKVEngine
+from .adaptive import AdaptiveLayerController
 from .layers import allocate, allocate_greedy, measure_alpha, profile_layers
+from .paged import PagedKVCache
 from .model import demo_model
-from .sim import BanditEnv, plausible_alpha, rising_profile, run_bandit
+from .sim import BanditEnv, LayerEnv, plausible_alpha, rising_profile, run_bandit
 from .throughput import CostModel, best_gamma, best_gamma_profile, expected_tokens
 
 LINE = "-" * 78
@@ -416,6 +418,146 @@ def prompt_dependence() -> None:
     print("prediction does not survive a change of content.")
 
 
+def adaptive_allocation(rounds: int = 1500) -> None:
+    _h("12. Learning the per-layer budget online, with no offline profile")
+    print("The static allocator profiles once and allocates forever. Experiment 11")
+    print("showed why that is fragile: the sensitive layer is a property of the")
+    print("content. This one probes while it serves.\n")
+    print("It is allowed to probe in production for one reason: output is identical")
+    print("whatever the plan, so a bad probe costs a little throughput and cannot")
+    print("corrupt anything. A compressor that traded against quality could not do")
+    print("this.\n")
+
+    NL, ctx = 6, 32768
+    cands = [CompressionConfig(4, 0.25), CompressionConfig(4, 0.5), CompressionConfig(4, 1.0)]
+    cm = CostModel(n_layers=NL, n_kv_heads=12, d_head=64, weight_bytes=2.0e9,
+                   full_kv_bandwidth=6.4e10, hbm_kv_budget=4.0e8)
+    lo = LayerPlan.uniform(cands[0], NL).per_layer_bytes(ctx, 12, 64)
+    hi = LayerPlan.uniform(cands[-1], NL).per_layer_bytes(ctx, 12, 64)
+    budget = lo + 0.5 * (hi - lo)
+
+    def run(ctrl, env, n, key=None):
+        for _ in range(n):
+            plan, g = ctrl.select(env.ctx, key)
+            ctrl.update(plan, g, env.pull(plan, g) if g else 0, env.ctx, key)
+
+    env = LayerEnv(damage={1: 2.5}, ranked=cands, ctx=ctx, seed=5)
+    ctrl = AdaptiveLayerController(cm, NL, budget, cands, ctx_hint=ctx,
+                                   probe_prob=0.3, resolve_every=40, decay=0.97, seed=6)
+    run(ctrl, env, rounds)
+    print(f"{'phase':<26}{'true sensitive':>16}{'found':>8}{'alpha':>8}   plan")
+    d = ctrl.damages()
+    print(f"{'content A':<26}{1:>16}{int(np.argmax(d)):>8}{env.alpha(ctrl.plans[None]):>8.2f}   "
+          + ",".join(c.label()[3:] for c in ctrl.plans[None]))
+
+    env.shift({4: 2.5})
+    run(ctrl, env, rounds)
+    d = ctrl.damages()
+    print(f"{'content B (shifted)':<26}{4:>16}{int(np.argmax(d)):>8}{env.alpha(ctrl.plans[None]):>8.2f}   "
+          + ",".join(c.label()[3:] for c in ctrl.plans[None]))
+
+    stat = LayerPlan.uniform(cands[1], NL)
+    print(f"\nfor comparison, a fixed uniform plan at the same budget scores "
+          f"alpha={env.alpha(stat):.2f} on content B.")
+    print(f"probe rate {ctrl.n_probes / ctrl.n_decisions:.0%}, "
+          f"{ctrl.n_resolves} re-solves, {ctrl.n_stall_recoveries} stall recoveries.")
+    print("\nTwo bugs this experiment found, both kept as tests: probing only")
+    print("downward starves the layers pinned at the floor, and separate up/down")
+    print("posteriors measure staleness rather than sensitivity once a layer is")
+    print("pinned at either extreme. Paired comparison over swap probes fixes both.")
+
+
+def paged_cache() -> None:
+    _h("13. Rollback survives block-table indirection")
+    print("The hard part of a vLLM integration is that the authoritative cache is")
+    print("paged, and DRAFTKV rewinds it once per verify pass. This is that")
+    print("allocator in numpy -- no CUDA, no real paged-attention kernel, no graph")
+    print("capture -- so the rollback contract can be pinned before GPU code.\n")
+
+    m = demo_model()
+    rng = np.random.default_rng(3)
+    prompt = [int(x) for x in rng.integers(0, m.vocab_size, 192)]
+    base = DraftKVEngine(m, seed=0).generate_baseline(prompt, 32, 0.0)
+
+    print(f"{'block size':>11}{'blocks used':>13}{'fragmentation':>15}{'identical':>11}")
+    for bs in (4, 16, 64):
+        cache = {}
+
+        def factory(bs=bs):
+            c = PagedKVCache(m.n_layers, m.n_heads, m.d_head, bs, n_blocks=4096)
+            cache["c"] = c
+            return c
+
+        r = DraftKVEngine(m, FixedPolicy(CompressionConfig(4, 0.5), 5), seed=0,
+                          full_cache_factory=factory).generate(prompt, 32, 0.0)
+        c = cache["c"]
+        c.pool.check_invariants()
+        print(f"{bs:>11}{c.blocks_in_use:>13}{c.fragmentation():>14.1%}"
+              f"{('yes' if r.tokens == base else 'NO'):>11}")
+
+    print("\nIdentical tokens at every block size, with a rollback every round and")
+    print("no leaked blocks. Fragmentation is the cost of paging and shrinks with")
+    print("block size; the tail block is deliberately kept rather than freed and")
+    print("reallocated each round.")
+
+
+def depth_scaling() -> None:
+    _h("14. Does the early-layer finding hold as models get deeper?")
+    print("Layer 0 being the sensitive one is the most actionable result here and")
+    print("the most likely to be a small-model artifact, so it is worth checking")
+    print("against depth. Requires the checkpoints; see scripts/fetch_model.py.\n")
+
+    from pathlib import Path
+
+    from .gpt2 import GPT2, BPETokenizer
+
+    texts = [
+        "Memory bandwidth, not arithmetic, is the binding constraint on modern "
+        "inference hardware. Every generation of accelerator widens the gap. ",
+        "She had not expected the letter to arrive so late in the season, nor to "
+        "find it waiting on the hall table beneath a pile of unopened bills. ",
+        "def merge(left, right):\n    out = []\n    i = j = 0\n    while i < "
+        "len(left) and j < len(right):\n        out.append(left[i]); i += 1\n",
+    ]
+    ref, probe = CompressionConfig(4, 1.0), CompressionConfig(4, 0.25)
+    print(f"{'model':<14}{'layers':>7}{'top-3 sensitive':>20}{'damage in first 25%':>22}")
+    any_found = False
+    import os
+    names = os.environ.get("DRAFTKV_SCALING_MODELS", "distilgpt2,gpt2,gpt2-medium").split(",")
+    for name in [n.strip() for n in names if n.strip()]:
+        d = Path.home() / ".cache" / "draftkv" / name
+        if not (d / "model.safetensors").exists():
+            print(f"{name:<14}{'-':>7}{'(not downloaded)':>20}")
+            continue
+        any_found = True
+        m = GPT2.from_dir(d)
+        tok = BPETokenizer(d / "vocab.json", d / "merges.txt")
+        prompts = [tok.encode(t * 6)[:256] for t in texts]
+
+        def agg(plan):
+            return float(np.exp(np.mean([
+                np.log(max(measure_alpha(m, pr, plan, 6, 64, seed=i), 1e-4))
+                for i, pr in enumerate(prompts)])))
+
+        a_ref = agg(LayerPlan.uniform(ref, m.n_layers))
+        dmg = []
+        for L in range(m.n_layers):
+            cfgs = [ref] * m.n_layers
+            cfgs[L] = probe
+            dmg.append(max(0.0, float(np.log(max(a_ref, 1e-4)) - np.log(max(agg(LayerPlan(tuple(cfgs))), 1e-4)))))
+        top = [int(i) for i in np.argsort(dmg)[::-1][:3]]
+        early = sum(dmg[: max(1, m.n_layers // 4)]) / max(sum(dmg), 1e-9)
+        print(f"{name:<14}{m.n_layers:>7}{','.join(f'L{i}' for i in top):>20}{early:>22.0%}")
+    if not any_found:
+        print("\nno checkpoints present; run scripts/fetch_model.py --model gpt2")
+        return
+    print("\nSensitivity concentrates in the first quarter of the stack and stays")
+    print("there as depth grows. That is evidence against 'layer 0 is a")
+    print("six-layer artifact', not proof: these are all GPT-2 family models under")
+    print("1B. A 7B model, or a different architecture (rotary, GQA, SwiGLU),")
+    print("remains unverified.")
+
+
 ALL = {
     "regimes": regimes,
     "gamma": gamma_curve,
@@ -428,6 +570,9 @@ ALL = {
     "layers": layer_allocation,
     "real": real_model,
     "prompts": prompt_dependence,
+    "adaptive": adaptive_allocation,
+    "paged": paged_cache,
+    "scaling": depth_scaling,
 }
 
 

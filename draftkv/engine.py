@@ -28,6 +28,11 @@ def _softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum(-1, keepdims=True)
 
 
+def _layer_cfgs(cfg, n_layers: int) -> list:
+    """Per-layer configs for either a LayerPlan or a single config."""
+    return list(cfg.cfgs) if hasattr(cfg, "cfgs") else [cfg] * n_layers
+
+
 def _probs(logits: np.ndarray, temperature: float) -> np.ndarray:
     if temperature <= 0.0:
         p = np.zeros_like(logits, dtype=np.float64)
@@ -52,6 +57,7 @@ class GenerationResult:
     draft_steps: int = 0
     verify_passes: int = 0
     cache_rebuilds: int = 0
+    layers_rebuilt: int = 0
 
     @property
     def new_tokens(self) -> int:
@@ -77,10 +83,19 @@ class DraftKVEngine:
     which is the premise that makes an online controller legitimate.
     """
 
-    def __init__(self, model, controller: Controller | None = None, seed: int = 0) -> None:
+    def __init__(
+        self,
+        model,
+        controller: Controller | None = None,
+        seed: int = 0,
+        full_cache_factory=None,
+    ) -> None:
         self.model = model
         self.controller = controller or FixedPolicy(CompressionConfig(4, 0.5), 4)
         self.rng = np.random.default_rng(seed)
+        # swappable so the authoritative cache can be a paged pool instead of a
+        # contiguous array; the rollback contract has to hold for both
+        self.full_cache_factory = full_cache_factory or (lambda: FullKVCache(model.n_layers))
 
     # ------------------------------------------------------------------ util
     def _sample(self, p: np.ndarray) -> int:
@@ -96,7 +111,7 @@ class DraftKVEngine:
     ) -> list[int]:
         """Plain full-KV autoregressive decoding -- the reference output."""
         tokens = list(prompt)
-        cache = FullKVCache(self.model.n_layers)
+        cache = self.full_cache_factory()
         if len(tokens) > 1:
             self.model.forward(np.array(tokens[:-1]), cache, 0)
         for _ in range(max_new_tokens):
@@ -114,7 +129,7 @@ class DraftKVEngine:
     ) -> GenerationResult:
         model = self.model
         tokens = list(prompt)
-        full = FullKVCache(model.n_layers)
+        full = self.full_cache_factory()
         if len(tokens) > 1:
             model.forward(np.array(tokens[:-1]), full, 0)
 
@@ -138,12 +153,20 @@ class DraftKVEngine:
                     comp.sync_from(full, n - 1)
                 continue
 
-            # -- drafter's cache: rebuild if the controller switched configs --
-            if comp is None or comp_cfg != cfg:
+            # -- drafter's cache: rebuild only the layers that actually changed --
+            if comp is None:
                 comp = CompressedKVCache(model.n_layers, cfg)
-                comp.sync_from(full, 0)     # O(ctx): this is what switch cost prices
+                comp.sync_from(full, 0)     # O(n_layers * ctx), once
                 comp_cfg = cfg
                 res.cache_rebuilds += 1
+            elif comp_cfg != cfg:
+                old = _layer_cfgs(comp_cfg, model.n_layers)
+                new = _layer_cfgs(cfg, model.n_layers)
+                changed = [L for L in range(model.n_layers) if old[L] != new[L]]
+                comp.rebuild_layers(full, changed, new)
+                comp_cfg = cfg
+                res.cache_rebuilds += 1
+                res.layers_rebuilt += len(changed)
 
             # ------------------------------------------------------ draft
             draft_tokens: list[int] = []
