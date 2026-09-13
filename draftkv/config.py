@@ -69,3 +69,51 @@ def default_arms(
 
 def gamma_range(gamma_max: int = 8) -> Iterator[int]:
     return iter(range(1, gamma_max + 1))
+
+
+@dataclass(frozen=True)
+class LayerPlan:
+    """A per-layer compression assignment.
+
+    One global config is a strong assumption: measurement on the reference
+    model shows identical 2-bit damage costs 0.62 acceptance in one layer and
+    0.33 in another.  Spending the same bits everywhere therefore overpays in
+    tolerant layers and starves sensitive ones.  A plan lets the byte budget be
+    distributed where it buys the most acceptance.
+    """
+
+    cfgs: tuple[CompressionConfig, ...]
+
+    def __len__(self) -> int:
+        return len(self.cfgs)
+
+    def __getitem__(self, i: int) -> CompressionConfig:
+        return self.cfgs[i]
+
+    def __iter__(self):
+        return iter(self.cfgs)
+
+    def per_layer_bytes(self, ctx: int, n_kv_heads: int, d_head: int) -> float:
+        """Exact K+V bytes for the whole plan -- summed per layer, not averaged.
+
+        Averaging `keep_frac` and `bytes_per_entry` separately would misprice a
+        mixed plan, since it is their product that matters per layer.
+        """
+        total = 0.0
+        for c in self.cfgs:
+            kept = min(ctx, max(c.sink + c.recent, int(round(c.keep_frac * ctx))))
+            total += 2.0 * kept * n_kv_heads * c.bytes_per_entry(d_head)
+        return total
+
+    def label(self) -> str:
+        uniq = sorted({c.label() for c in self.cfgs})
+        if len(uniq) == 1:
+            return f"plan[{uniq[0]}]"
+        counts: dict[str, int] = {}
+        for c in self.cfgs:
+            counts[c.label()] = counts.get(c.label(), 0) + 1
+        return "plan[" + ",".join(f"{k}x{v}" for k, v in sorted(counts.items())) + "]"
+
+    @classmethod
+    def uniform(cls, cfg: CompressionConfig, n_layers: int) -> "LayerPlan":
+        return cls(tuple(cfg for _ in range(n_layers)))

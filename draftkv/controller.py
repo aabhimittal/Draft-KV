@@ -23,7 +23,7 @@ from typing import Protocol, Sequence
 import numpy as np
 
 from .config import CompressionConfig, default_arms
-from .throughput import CostModel, best_gamma, expected_tokens
+from .throughput import CostModel, best_gamma, best_gamma_profile, expected_tokens
 
 
 class Controller(Protocol):
@@ -228,3 +228,108 @@ class OraclePolicy:
 
     def update(self, cfg, gamma, accepted, ctx, key=None) -> None:
         pass
+
+
+class DepthThompsonController:
+    """Thompson sampling over configs with a *depth-indexed* acceptance model.
+
+    `ThompsonController` estimates one alpha per config, which is what the
+    geometric E(alpha, gamma) assumes.  Measurement says that assumption is
+    wrong in a specific, exploitable direction: acceptance rises with draft
+    depth, because reaching depth i is evidence the current region drafts
+    easily.  Fitting one alpha to that data anchors it near the depth-0 rate
+    and truncates gamma far too early.
+
+    Here each (config, depth) keeps its own Beta.  The data is identical -- a
+    round with k accepted out of gamma reports successes at depths 0..k-1 and
+    one failure at depth k -- it is only indexed differently.  Depths never
+    observed borrow the deepest depth that has data, rather than falling back
+    on an optimistic prior.
+    """
+
+    def __init__(
+        self,
+        cost: CostModel,
+        arms: Sequence[CompressionConfig] | None = None,
+        gamma_max: int = 12,
+        decay: float = 0.995,
+        min_speedup: float = 1.05,
+        switch_amortize: int = 32,
+        seed: int = 0,
+        prior: tuple[float, float] = (2.0, 1.0),
+        min_obs: float = 1.0,
+    ) -> None:
+        self.cost = cost
+        self.arms = list(arms or default_arms())
+        self.gamma_max = gamma_max
+        self.decay = decay
+        self.min_speedup = min_speedup
+        self.switch_amortize = max(1, switch_amortize)
+        self.rng = np.random.default_rng(seed)
+        self.prior = prior
+        self.min_obs = min_obs
+        self.post: dict[tuple[str | None, CompressionConfig], list[_Beta]] = {}
+        self.obs: dict[tuple[str | None, CompressionConfig], list[float]] = {}
+        self._held: CompressionConfig | None = None
+        self.switches = 0
+
+    def _profile_post(self, cfg: CompressionConfig, key: str | None) -> list[_Beta]:
+        k = (key, cfg)
+        if k not in self.post:
+            self.post[k] = [_Beta(*self.prior) for _ in range(self.gamma_max)]
+            self.obs[k] = [0.0] * self.gamma_max
+        return self.post[k]
+
+    def sample_profile(self, cfg: CompressionConfig, key: str | None = None) -> list[float]:
+        """One Thompson draw of the whole depth profile."""
+        post = self._profile_post(cfg, key)
+        obs = self.obs[(key, cfg)]
+        out: list[float] = []
+        last = None
+        for d in range(self.gamma_max):
+            if obs[d] >= self.min_obs:
+                last = post[d].sample(self.rng)
+                out.append(last)
+            else:
+                out.append(last if last is not None else post[d].sample(self.rng))
+        return out
+
+    def mean_profile(self, cfg: CompressionConfig, key: str | None = None) -> list[float]:
+        post = self._profile_post(cfg, key)
+        obs = self.obs[(key, cfg)]
+        out, last = [], None
+        for d in range(self.gamma_max):
+            if obs[d] >= self.min_obs:
+                last = post[d].mean
+            out.append(last if last is not None else post[d].mean)
+        return out
+
+    # ------------------------------------------------------------------ api
+    def select(self, ctx: int, key: str | None = None) -> tuple[CompressionConfig, int]:
+        base = 1.0 / self.cost.t_baseline(ctx)
+        penalty = self.cost.rebuild_cost(ctx) / self.switch_amortize
+        best_cfg, best_g, best_t = self.arms[0], 0, base
+        for cfg in self.arms:
+            prof = self.sample_profile(cfg, key)
+            extra = 0.0 if cfg == self._held else penalty
+            g, t = best_gamma_profile(self.cost, cfg, prof, ctx, extra)
+            if g > 0 and t > best_t:
+                best_cfg, best_g, best_t = cfg, g, t
+        if best_g > 0 and best_cfg != self._held:
+            self._held = best_cfg
+            self.switches += 1
+        if best_g > 0 and best_t < base * self.min_speedup:
+            best_g = 0
+        return best_cfg, best_g
+
+    def update(self, cfg, gamma, accepted, ctx, key=None) -> None:
+        if gamma <= 0:
+            return
+        post = self._profile_post(cfg, key)
+        obs = self.obs[(key, cfg)]
+        for d in range(min(accepted, self.gamma_max)):
+            post[d].observe(1, 1, self.decay)
+            obs[d] += 1
+        if accepted < gamma and accepted < self.gamma_max:
+            post[accepted].observe(0, 1, self.decay)
+            obs[accepted] += 1

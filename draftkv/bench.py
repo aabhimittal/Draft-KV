@@ -7,12 +7,19 @@ import time
 
 import numpy as np
 
-from .config import CompressionConfig, default_arms
-from .controller import FixedPolicy, FlatBandit, OraclePolicy, ThompsonController
+from .config import CompressionConfig, LayerPlan, default_arms
+from .controller import (
+    DepthThompsonController,
+    FixedPolicy,
+    FlatBandit,
+    OraclePolicy,
+    ThompsonController,
+)
 from .engine import DraftKVEngine
+from .layers import allocate, allocate_greedy, measure_alpha, profile_layers
 from .model import demo_model
-from .sim import BanditEnv, plausible_alpha, run_bandit
-from .throughput import CostModel, best_gamma, expected_tokens
+from .sim import BanditEnv, plausible_alpha, rising_profile, run_bandit
+from .throughput import CostModel, best_gamma, best_gamma_profile, expected_tokens
 
 LINE = "-" * 78
 
@@ -215,6 +222,90 @@ def end_to_end(n_new: int = 240) -> None:
     print("\nmost played configs:", ", ".join(f"{k} x{v}" for k, v in top))
 
 
+def depth_profile(rounds: int = 2000) -> None:
+    _h("8. Acceptance is not flat in draft depth -- and it rises")
+    print("Measured on the reference model, P(accept at depth i | reached i):")
+    print("  4b/keep0.5 :  0.51  0.80  0.83  0.85  0.88  1.00  0.93  0.93")
+    print("Not drift -- survivorship. Reaching depth i is itself evidence that")
+    print("this stretch drafts easily, so the conditional rate climbs. A single")
+    print("alpha fitted to that data lands near the depth-0 rate and truncates")
+    print("gamma far too early.\n")
+
+    cm = CostModel(full_kv_bandwidth=6.4e10, hbm_kv_budget=1.0e9)
+    cfg = CompressionConfig(4, 0.5)
+    rising = rising_profile(0.51, 12)
+    g_prof, t_prof = best_gamma_profile(cm, cfg, rising, 32768)
+    g_iid, _ = best_gamma(cm, cfg, 0.51, 32768, 12)
+    print(f"{'model':<34}{'gamma*':>8}{'true throughput':>18}")
+    for name, g in (("depth profile (correct)", g_prof), ("one alpha fitted at depth 0", g_iid)):
+        t = cm.throughput_profile(cfg, rising[:g], 32768)
+        print(f"{name:<34}{g:>8}{t * cm.t_baseline(32768):>17.2f}x")
+
+    arms = default_arms()
+    alphas = {c: plausible_alpha(c) for c in arms}
+    profiles = {c: rising_profile(alphas[c], 12) for c in arms}
+    env = lambda: BanditEnv(alphas, 32768, seed=3, profiles=profiles)
+    opt = env().true_best(cm, 12)[2]
+    print(f"\nOnline, against an environment with this shape ({rounds} rounds):")
+    print(f"{'controller':<34}{'speedup':>9}{'% of opt':>10}")
+    for name, ctrl in (
+        ("depth-indexed Thompson", DepthThompsonController(cm, arms, gamma_max=12, seed=1)),
+        ("one-alpha Thompson", ThompsonController(cm, arms, gamma_max=12, seed=1)),
+    ):
+        o = run_bandit(ctrl, env(), cm, rounds)
+        print(f"{name:<34}{o['mean_throughput'] * cm.t_baseline(32768):>9.2f}x"
+              f"{100 * o['mean_throughput'] / opt:>9.1f}%")
+    print("\nSame data, indexed by depth instead of pooled. The i.i.d. model is not")
+    print("merely imprecise here -- it is biased toward short drafts.")
+
+
+def layer_allocation(n_new: int = 160) -> None:
+    _h("9. Per-layer bit allocation beats uniform compression at equal bytes")
+    m = demo_model()
+    rng = np.random.default_rng(0)
+    prompt = [int(x) for x in rng.integers(0, m.vocab_size, 320)]
+    cands = [CompressionConfig(2, 0.5), CompressionConfig(3, 0.5),
+             CompressionConfig(4, 1.0), CompressionConfig(8, 1.0)]
+    prof = profile_layers(m, prompt, cands, n_new=n_new)
+
+    print("acceptance with ONE layer degraded (others fp16):")
+    print(f"{'layer':>6}" + "".join(f"{c.label():>14}" for c in cands))
+    for L in range(m.n_layers):
+        print(f"{L:>6}" + "".join(f"{prof.alpha[(L, c)]:>14.2f}" for c in cands))
+    print(f"\nSame bits, very different cost. (min drafted tokens behind any cell:"
+          f" {prof.min_trials}; below ~200 the profile is too noisy to rank"
+          f" neighbouring configs, and the allocation degrades with it.)")
+
+    nkv, dh, ctx = m.n_heads, m.d_head, 400
+    ub = lambda c: LayerPlan.uniform(c, m.n_layers).per_layer_bytes(ctx, nkv, dh)
+    print(f"\nmeasured acceptance at equal byte budgets:")
+    print(f"{'budget (B)':>11}  {'exact-DP plan':<30}{'alpha':>7}  "
+          f"{'greedy plan':<30}{'alpha':>7}  {'best uniform':<12}{'alpha':>7}")
+    for frac in (0.3, 0.5, 0.7, 0.9):
+        b = ub(cands[0]) + frac * (ub(cands[-1]) - ub(cands[0]))
+        dp = allocate(prof, b, ctx, nkv, dh, m.n_layers)
+        gr = allocate_greedy(prof, b, ctx, nkv, dh, m.n_layers)
+        uc = max([c for c in cands if ub(c) <= b], key=ub)
+        print(f"{int(b):>11}  {dp.label():<30}{measure_alpha(m, prompt, dp, n_new=n_new):>7.3f}  "
+              f"{gr.label():<30}{measure_alpha(m, prompt, gr, n_new=n_new):>7.3f}  "
+              f"{uc.label():<12}"
+              f"{measure_alpha(m, prompt, LayerPlan.uniform(uc, m.n_layers), n_new=n_new):>7.3f}")
+    print("\nTwo things had to be right for this to work.")
+    print(" * The objective: per-layer damages are assumed to add in log-acceptance.")
+    print("   That is a decent ordering and a poor absolute predictor -- it")
+    print("   over-estimates damage once several layers are degraded at once -- so")
+    print("   the tests pin the ordering, not the prediction.")
+    print(" * The optimizer: greedy over adjacent upgrades is not optimal, though on")
+    print("   this particular profile it happens to find the same plans -- the")
+    print("   damages here are smoothly graded, which is the easy case. It breaks")
+    print("   when a layer's value sits entirely in its top config: every")
+    print("   intermediate step scores zero gain, so greedy never climbs and")
+    print("   strands that layer at 2-bit while overspending elsewhere")
+    print("   (test_exact_dp_beats_greedy_on_its_failure_mode pins that). Exact")
+    print("   knapsack DP over the Pareto frontier is optimal either way, and")
+    print("   recovers the uniform plan whenever uniform genuinely is best.")
+
+
 ALL = {
     "regimes": regimes,
     "gamma": gamma_curve,
@@ -223,6 +314,8 @@ ALL = {
     "nonstationary": nonstationary,
     "gating": context_gating,
     "e2e": end_to_end,
+    "depth": depth_profile,
+    "layers": layer_allocation,
 }
 
 

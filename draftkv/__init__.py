@@ -7,27 +7,48 @@ online from the acceptance rate the verify pass hands you for free.
 """
 
 from .compress import CompressedKVCache, FullKVCache, quantize
-from .config import CompressionConfig, default_arms
-from .controller import FixedPolicy, FlatBandit, OraclePolicy, ThompsonController
+from .config import CompressionConfig, LayerPlan, default_arms
+from .controller import (
+    DepthThompsonController,
+    FixedPolicy,
+    FlatBandit,
+    OraclePolicy,
+    ThompsonController,
+)
 from .engine import DraftKVEngine, GenerationResult
 from .model import TinyTransformer
-from .throughput import CostModel, best_gamma, expected_tokens
+from .layers import SensitivityProfile, allocate, measure_alpha, profile_layers
+from .throughput import (
+    CostModel,
+    best_gamma,
+    best_gamma_profile,
+    expected_tokens,
+    expected_tokens_profile,
+)
 
 __all__ = [
     "CompressedKVCache",
     "CompressionConfig",
     "CostModel",
+    "DepthThompsonController",
     "DraftKVEngine",
     "FixedPolicy",
     "FlatBandit",
     "FullKVCache",
     "GenerationResult",
+    "LayerPlan",
     "OraclePolicy",
+    "SensitivityProfile",
     "ThompsonController",
     "TinyTransformer",
+    "allocate",
     "best_gamma",
+    "best_gamma_profile",
     "default_arms",
     "expected_tokens",
+    "expected_tokens_profile",
+    "measure_alpha",
+    "profile_layers",
     "quantize",
 ]
 __version__ = "0.1.0"
