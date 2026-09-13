@@ -18,8 +18,10 @@ with the losslessness claim as an executable test rather than an assertion.
 
 ```bash
 pip install -e .
-python -m draftkv.bench all      # nine experiments
-pytest -q                        # 69 tests
+python -m draftkv.bench all      # eleven experiments
+pytest -q                        # 86 tests
+
+python scripts/fetch_model.py    # optional: distilgpt2, enables the real-model work
 ```
 
 ## The idea in one paragraph
@@ -149,6 +151,136 @@ tax first. The case for the controller is that it lands on that arm without
 hindsight, stays far above the config you would pick blind throughout, and keeps
 working when the content changes, which no fixed choice does.
 
+## What survives contact with a real model
+
+Everything above and below was developed against a random-weight transformer.
+`draftkv/gpt2.py` runs **distilgpt2** -- real open-source weights, real text --
+in numpy, behind the same `forward(tokens, cache, start_pos)` contract, so the
+engine, controller and allocator are unchanged and only the model differs.
+Weights load straight from safetensors; there is no torch dependency.
+
+```
+config        identical   alpha   tok/verify
+fp16/keep1          yes   1.000         4.80
+8b/keep1            yes   1.000         4.80
+4b/keep1            yes   0.857         4.00
+4b/keep0.5          yes   0.026         1.09
+2b/keep0.25         yes   0.024         1.09
+```
+
+**Losslessness transfers exactly** -- the one thing that had to.
+
+**Two findings invert what the toy model implied:**
+
+- *Quantization is nearly free.* 8-bit is exact; 4-bit stays at 0.86-1.00. The
+  random-weight model put 4-bit at 0.66. A random-weight transformer has
+  diffuse attention and no learned structure to preserve, so it exaggerates
+  quantization damage badly.
+- *Eviction is the damaging axis.* Dropping tokens is what collapses
+  acceptance, not narrowing them. On a real model the budget worth allocating
+  per layer is **tokens, not bits** -- so `profile_layers` is now run over
+  `keep_frac` candidates at fixed 4-bit.
+
+**One finding replicates, more strongly.** The depth-rise is real:
+
+```
+P(accept at depth i | reached i), 4b/keep0.5, distilgpt2
+depth   0     1     2     3     4     5     6     7
+      0.28  1.00  1.00  1.00  1.00  1.00  1.00  1.00
+```
+
+## Acceptance belongs to the content, not the config
+
+The single most important number from the real-model work is a noise figure.
+Measuring the same plan on different passages:
+
+| | |
+|---|---|
+| sd of log-acceptance for one profile cell, across prompts | **~1.2** |
+| error of the best per-layer damage model | ~1.5 |
+
+The same plan measures 0.95 on one passage and 0.10 on another. Content
+dominates the compression config, and by a wide margin. Consequences, in order
+of how much they hurt:
+
+1. **A single-prompt profile is not a measurement of the layer, it is a
+   measurement of the prompt.** `profile_layers` now takes a *list* of prompts,
+   aggregates cells as a geometric mean, and records `spread` --
+   `SensitivityProfile.noise` reports the sd so a damage estimate can be
+   compared against its own error bar. The first version of this happily
+   reported a profile with no idea that half its cells were noise.
+2. **The absolute damage prediction does not survive a change of content**, so
+   `predicted_alpha` is a ranking device and must not be read as a forecast.
+3. **The ranking does survive**, which is what saves the allocator:
+
+| prompt | ref | L0 | L1 | L2 | L3 | L4 | L5 | most sensitive |
+|---|---|---|---|---|---|---|---|---|
+| tech | 0.88 | **0.23** | 0.77 | 0.87 | 0.88 | 0.83 | 0.77 | L0 |
+| prose | 1.00 | **0.48** | 1.00 | 1.00 | 0.74 | 1.00 | 1.00 | L0 |
+| code | 1.00 | **0.78** | 1.00 | 1.00 | 0.92 | 1.00 | 1.00 | L0 |
+| list | 1.00 | **0.32** | 0.96 | 1.00 | 0.67 | 1.00 | 1.00 | L0 |
+
+Layer 0 is the most sensitive layer on **every** prompt; prose, code and list
+agree on the entire ordering (Spearman +1.0). Layers 1, 2, 4 and 5 tolerate
+having 85% of their KV tokens evicted at no measurable cost. That is a large
+win available to a per-layer allocator and invisible to a uniform one -- and it
+is exactly the ordering the knapsack consumes.
+
+4. **It strengthens the online controller and weakens offline profiling.** If
+   alpha moves this much with content, the component that measures it
+   continuously from the verify pass is doing the real work; a static profile
+   is a prior, not an answer.
+
+## Fixing the wrong thing: log-additivity was not the problem
+
+The allocator composes per-layer damages by adding them in log-acceptance
+(equivalently, acceptance multiplies across layers). On the random-weight model
+that rule mispredicted mixed plans badly, so the obvious next move was a better
+composition rule. `SensitivityProfile.p` generalizes additivity to a power mean,
+
+```
+predicted damage = (sum_L D_L ** p) ** (1/p)
+```
+
+with p = 1 recovering log-additivity, p > 1 interpolating toward "only the
+worst layer matters" (errors overlap) and p < 1 toward super-additive (errors
+amplify). It costs the optimizer nothing: minimizing `(sum D**p)**(1/p)` is
+minimizing `sum D**p`, still separable, so the same exact knapsack runs against
+`objective()` instead of `damage()`.
+
+Then measuring it properly on distilgpt2 showed the premise was wrong.
+
+| | RMSE (log alpha) |
+|---|---|
+| log-additive, p = 1 | **0.098** |
+| fitted p = 0.90, in-sample | 0.096 |
+| fitted p = 0.90, leave-one-out | **0.114** (worse) |
+| measurement noise floor | 0.13 |
+
+Additive prediction error is *already below the noise floor of the measurement
+it is fitted to*. The exponent buys 0.002 in-sample and loses 0.016 under
+cross-validation -- it is fitting noise. The earlier "log-additivity is a poor
+predictor" conclusion was an artifact of profiling on a single prompt, where
+the noise was 1.17 rather than 0.13. **The fix was averaging the profile over
+several prompts, not a better composition rule.**
+
+What ships is therefore a guard rather than a better model:
+
+- `p` defaults to 1.0 and stays there.
+- `fit_composition` computes leave-one-out error and **refuses to adopt a fit
+  that does not generalize**, returning `adopted: False` and leaving `p` at 1.0.
+  `require_cv=False` shows the unguarded fit, which on this data moves p and
+  makes things worse.
+- `test_noise_around_an_additive_truth_leaves_p_alone` pins the behaviour, and
+  the p-norm machinery is kept because the direction of the error is genuinely
+  model-dependent -- if a model does show composition structure above its noise
+  floor, the mechanism is there and cross-validated.
+
+The general lesson is worth more than the feature: an in-sample improvement on
+a dozen noisy points is not evidence, and the honest first question about a
+model that predicts badly is whether the thing it is predicting was measured
+well enough to predict.
+
 ## Two corrections the measurements forced
 
 The first version of this took the problem statement's model at face value: one
@@ -210,9 +342,10 @@ byte budget to minimize total damage. Measured acceptance at equal bytes:
 Two things had to be right, and neither was on the first attempt:
 
 - **The objective.** Per-layer damages are assumed to add in log-acceptance.
-  That is a serviceable *ordering* and a poor absolute predictor -- it
-  over-estimates damage badly once several layers are degraded at once. The
-  tests pin the ordering, not the prediction.
+  On this random-weight model that looked like a poor absolute predictor; the
+  real-model work below shows the diagnosis was wrong, and what was actually
+  broken was the measurement. See *Fixing the wrong thing* -- the tests pin the
+  ordering, not the prediction.
 - **The optimizer.** Greedy over adjacent upgrades is not optimal: it cannot
   climb a layer whose value sits entirely in its top config, since every
   intermediate step scores zero gain, and it strands that layer at 2-bit while
@@ -273,9 +406,11 @@ Two subtleties that are easy to get wrong and are handled explicitly:
 | `engine.py` | the draft/verify loop, rollback, and resync |
 | `throughput.py` | `E(alpha, gamma)`, the depth-indexed `E`, the memory-traffic cost model, `ceiling()`, `best_gamma` |
 | `controller.py` | Thompson sampling (pooled and depth-indexed), flat-product baseline, oracle, fixed policies |
-| `layers.py` | per-layer sensitivity profiling and exact-knapsack bit allocation |
+| `layers.py` | multi-prompt sensitivity profiling, composition model, exact-knapsack allocation |
+| `gpt2.py` | distilgpt2 in numpy (safetensors reader, BPE), behind the same cache contract |
+| `scripts/fetch_model.py` | optional checkpoint download; real-model tests skip without it |
 | `sim.py` | bandit environment with known ground-truth `alpha(c)` |
-| `bench.py` | the nine experiments |
+| `bench.py` | the eleven experiments |
 | `.github/workflows/tests.yml` | CI: full suite on Python 3.10-3.13, losslessness as a separate fast lane |
 
 The reference model has random weights, so the text is gibberish — irrelevant,
@@ -293,9 +428,10 @@ losslessness test vacuous.
   or eager mode — one reason to quantize `gamma` to a handful of values). The
   cost model is written so those costs can be measured and substituted rather
   than assumed.
-- **No real-model acceptance rates.** `sim.plausible_alpha` is a stylized shape,
-  not a calibration. Real `alpha(c)` is exactly the thing the controller exists
-  to measure, and quoting invented numbers for it would defeat the point.
+- **No large-model numbers.** distilgpt2 is real but small (6 layers, 82M).
+  Its per-layer sensitivity concentrating in layer 0 may or may not hold at
+  scale, and `sim.plausible_alpha` remains a stylized shape for the simulator,
+  not a calibration.
 - **No claim that this is VeriCache.** It implements the mechanism the idea
   describes, and specifically does not assume the paper's handling of where the
   full cache lives — that is modeled explicitly here as a bandwidth and budget
