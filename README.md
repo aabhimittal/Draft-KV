@@ -18,10 +18,11 @@ with the losslessness claim as an executable test rather than an assertion.
 
 ```bash
 pip install -e .
-python -m draftkv.bench all      # fourteen experiments
-pytest -q                        # 106 tests
+python -m draftkv.bench all      # sixteen experiments
+pytest -q                        # 121 tests
 
-python scripts/fetch_model.py    # optional: distilgpt2, enables the real-model work
+python scripts/fetch_model.py                                     # distilgpt2
+python scripts/fetch_model.py --model HuggingFaceTB/SmolLM2-135M  # RoPE + GQA + SwiGLU
 ```
 
 ## The idea in one paragraph
@@ -281,6 +282,111 @@ a dozen noisy points is not evidence, and the honest first question about a
 model that predicts badly is whether the thing it is predicting was measured
 well enough to predict.
 
+## Does any of it survive a modern architecture?
+
+Every measurement up to here used the GPT-2 family: learned positional
+embeddings, full multi-head attention, GELU. Current models use none of those.
+`draftkv/llama.py` runs Llama- and Qwen2-style checkpoints in numpy -- RoPE,
+grouped-query attention, RMSNorm, SwiGLU -- behind the same cache contract:
+
+| model | layers | attention | verified |
+|---|---|---|---|
+| SmolLM2-135M | 30 | GQA 3:1 | lossless at every config |
+| Qwen2.5-0.5B | 24 | GQA 7:1 | lossless at every config |
+
+Nothing in the engine, controller, allocator or paged pool changed. The cache
+stores **KV heads, not query heads**, which is what GQA alters, and that flows
+through the abstraction untouched -- a random-weight Llama factory
+(`demo_llama`) gives the whole path CI coverage with no download.
+
+### The bad news: GQA has already eaten what DRAFTKV wants to save
+
+This is the largest consequence of leaving GPT-2 behind, and it is negative.
+The speedup ceiling is a ratio of memory traffic; GQA shrinks the KV cache by
+its ratio, so it removes most of the KV traffic *before* DRAFTKV gets to
+compress any of it.
+
+| attention | context for a 1.5x ceiling (HBM) | with the cache offloaded |
+|---|---|---|
+| MHA (32 kv heads) | 19,343 | 492 |
+| GQA 4:1 (8 kv) | 77,372 | 1,967 |
+| GQA 8:1 (4 kv) | 154,742 | 3,934 |
+| MQA (1 kv) | 618,967 | 15,736 |
+
+Break-even moves out by almost exactly the GQA ratio
+(`test_gqa_pushes_the_breakeven_context_out_by_its_ratio` pins the proportion).
+On an HBM-resident cache with 4:1 GQA you need ~77k tokens before a 1.5x
+ceiling exists at all. Offloading is what rescues it: there the comparison is
+against PCIe rather than HBM, and break-even is a couple of thousand tokens
+even under GQA.
+
+**So on a current model the honest pitch is narrower than it looked on GPT-2:
+long context, or an offloaded cache, and not much else.** The earlier regime
+tables were computed with `n_kv_heads=8` and so already assumed GQA, but the
+per-architecture comparison makes the size of the effect explicit.
+
+### The early-layer concentration is a GPT-2 property
+
+The per-layer allocator was motivated by sensitivity concentrating in a few
+layers. Same probe (one layer evicted to keep-0.25, others 4-bit full,
+averaged over three prompts), now across both families:
+
+| model | family | layers | attention | damage in first 25% | top-3 sensitive |
+|---|---|---|---|---|---|
+| distilgpt2 | GPT-2 | 6 | MHA | 62% | 0, 3, 5 |
+| gpt2 | GPT-2 | 12 | MHA | 94% | 1, 0, 11 |
+| gpt2-medium | GPT-2 | 24 | MHA | 100% | 1, 2, 3 |
+| **SmolLM2-135M** | Llama | 30 | GQA 3:1 | **11%** | 18, 14, 12 |
+| **Qwen2.5-0.5B** | Qwen2 | 24 | GQA 7:1 | **27%** | 1, 17, 10 |
+
+It does not transfer. On the modern models the damage is spread thinly across
+the stack, the most sensitive layers sit in the *middle*, and the absolute
+numbers are tiny -- the largest single-layer damage is 0.07 on SmolLM2 and 0.09
+on Qwen2.5, against 3.02 on gpt2-medium. Evicting any one layer's KV barely
+moves acceptance.
+
+Previous rounds reported the concentration "sharpening with depth" from 62% to
+100%. That trend was real *within the GPT-2 family* and I over-generalized it:
+what the depth sweep actually varied was depth and family together, and family
+turns out to be the variable that mattered.
+
+The consequence for the design is direct and unflattering to the static
+allocator: **there is much less per-layer structure to exploit on a current
+model.** The adaptive allocator degrades correctly here -- with near-uniform
+damages it allocates near-uniformly -- but its headline win on the simulator
+assumed one clearly sensitive layer, which these models do not have.
+
+### 8-bit is not universally free either
+
+`8b/keep1` is exactly lossless in acceptance on distilgpt2 and costs nothing.
+On Qwen2.5-0.5B it drops acceptance to 0.647. Qwen's activation outliers are
+harder to quantize, and "quantization is nearly free" -- stated earlier from
+GPT-2 measurements -- is another family-specific result rather than a property
+of KV caches.
+
+### The depth effect does not clearly replicate
+
+Measured acceptance by draft depth on SmolLM2-135M at 4b/keep-0.25:
+
+```
+depth   0     1     2     3     4     5     6     7
+      0.68  0.62  0.56  0.56  0.60  1.00  0.33  0.00
+```
+
+Flat, not rising -- against the strong rise seen across the GPT-2 family
+(0.28 -> 1.00 on distilgpt2). Qwen2.5-0.5B is mildly rising (0.89, 0.69, 0.91,
+1.00, 1.00, 0.90, 1.00, 1.00), so the effect is somewhere between absent and
+weak on modern architectures. The deep tail rests on very few surviving drafts
+in all cases and should not be read as a trend in either direction.
+
+This matters for how much weight the depth-indexed controller deserves. It does
+not invalidate the design: `expected_tokens_profile` reduces exactly to the
+geometric closed form on a flat profile, and
+`test_depth_controller_is_no_worse_on_flat_data` pins that the depth-indexed
+controller costs nothing when the effect is absent. So the generalization is
+safe to keep, but its *benefit* is architecture-dependent and should not be
+quoted as a general property.
+
 ## Is the early-layer result a small-model artifact?
 
 The most actionable finding here -- sensitivity concentrating in the first
@@ -517,11 +623,12 @@ Two subtleties that are easy to get wrong and are handled explicitly:
 | `controller.py` | Thompson sampling (pooled and depth-indexed), flat-product baseline, oracle, fixed policies |
 | `layers.py` | multi-prompt sensitivity profiling, composition model, exact-knapsack allocation |
 | `gpt2.py` | distilgpt2 / gpt2 / gpt2-medium in numpy (safetensors, BPE), same cache contract |
+| `llama.py` | Llama / Qwen2 in numpy: RoPE, GQA, RMSNorm, SwiGLU, same cache contract |
 | `adaptive.py` | online per-layer allocation via budget-neutral swap probes |
 | `paged.py` | block-paged authoritative cache with rollback, the vLLM-shaped part |
 | `scripts/fetch_model.py` | optional checkpoint download; real-model tests skip without it |
 | `sim.py` | bandit environment with known ground-truth `alpha(c)` |
-| `bench.py` | the fourteen experiments |
+| `bench.py` | the sixteen experiments |
 | `.github/workflows/tests.yml` | CI: full suite on Python 3.10-3.13, losslessness as a separate fast lane |
 
 The reference model has random weights, so the text is gibberish — irrelevant,
@@ -539,11 +646,11 @@ losslessness test vacuous.
   or eager mode — one reason to quantize `gamma` to a handful of values). The
   cost model is written so those costs can be measured and substituted rather
   than assumed.
-- **No large-model numbers, and no modern architecture.** The scaling check
-  covers 6 -> 12 -> 24 layers, all GPT-2 family, all under 1B. Rotary
-  embeddings, grouped-query attention and SwiGLU are untested, as is anything
-  at 7B. `sim.plausible_alpha` remains a stylized shape for the simulator, not
-  a calibration.
+- **No 7B.** Architecture coverage now spans GPT-2 family and Llama/Qwen2
+  (RoPE, GQA, RMSNorm, SwiGLU) from 82M to 0.5B, but a 7B model in fp32 needs
+  ~28 GB of RAM and this environment has 15 GB, so it is genuinely out of reach
+  here rather than merely skipped. `sim.plausible_alpha` remains a stylized
+  shape for the simulator, not a calibration.
 - **No claim that this is VeriCache.** It implements the mechanism the idea
   describes, and specifically does not assume the paper's handling of where the
   full cache lives — that is modeled explicitly here as a bandwidth and budget
